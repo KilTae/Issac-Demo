@@ -5,6 +5,10 @@ import {
 } from 'react-native';
 import {SafeAreaView} from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import {
+  startBackgroundService, stopBackgroundService,
+  isBackgroundServiceRunning, getBackgroundLogs,
+} from '../services/AutoTradeService';
 import {useNavigation, useRoute, RouteProp} from '@react-navigation/native';
 import {NativeStackNavigationProp} from '@react-navigation/native-stack';
 import {RootStackParamList} from '../navigation/RootNavigator';
@@ -214,6 +218,23 @@ const OrderScreen = () => {
   const [autoOptPrice,      setAutoOptPrice]      = useState<number | null>(null);
   const [autoFutPrice,      setAutoFutPrice]      = useState<number | null>(null);
   const [allSavedConfigs,   setAllSavedConfigs]   = useState<Record<string, AutoConfig>>({});
+  const [bgRunning,         setBgRunning]         = useState(false);
+
+  // 백그라운드 서비스 상태 + 로그 5초마다 동기화
+  useEffect(() => {
+    setBgRunning(isBackgroundServiceRunning());
+    const sync = setInterval(async () => {
+      const running = isBackgroundServiceRunning();
+      setBgRunning(running);
+      if (running) {
+        const logs = await getBackgroundLogs();
+        if (logs.length > 0) setAutoLog(logs);
+        const val = await AsyncStorage.getItem('autoConfigs');
+        if (val) setAllSavedConfigs(JSON.parse(val));
+      }
+    }, 5000);
+    return () => clearInterval(sync);
+  }, []);
   const [autoConfig,    setAutoConfig]    = useState<AutoConfig>({
     // 풋옵션 종목코드 — 현재 진입한 종목이 옵션이면 그 코드를 자동 세팅
     putOptCode:        isFuturesCode ? '' : (shcode ?? ''),
@@ -396,7 +417,14 @@ const OrderScreen = () => {
     addLog('자동화 모니터링 시작');
     addLog(`풋옵션 코드: ${autoConfig.putOptCode} / 행사가: ${autoConfig.putStrike}`);
     addLog(`선물 자동 매수: ${autoConfig.futuresCode}`);
-    if (autoConfig.exitEnabled)       addLog(`청산 예약: ${autoConfig.exitThreshold.toFixed(2)} 이하`);
+    if (autoConfig.exitEnabled) addLog(`청산 예약: ${autoConfig.exitThreshold.toFixed(2)} 이하`);
+
+    // 백그라운드 서비스 시작 (앱 꺼져도 동작)
+    if (!isBackgroundServiceRunning()) {
+      startBackgroundService()
+        .then(() => setBgRunning(true))
+        .catch(e => console.log('❌ BG 시작 실패:', e?.message));
+    }
 
     autoIntervalRef.current = setInterval(async () => {
       const now = nowHHMMSS();
@@ -1437,7 +1465,9 @@ const OrderScreen = () => {
                   <View style={[as.statusBanner, {borderColor:C.green, backgroundColor:'#E8F5E9'}]}>
                     <View style={{flexDirection:'row', alignItems:'center', gap:8}}>
                       <ActivityIndicator size="small" color={C.green}/>
-                      <Text style={[as.statusText, {color:C.green}]}>모니터링 중 (10초 간격)</Text>
+                      <Text style={[as.statusText, {color:C.green}]}>
+                        모니터링 중 (10초 간격){bgRunning ? '  ·  백그라운드 ✓' : ''}
+                      </Text>
                     </View>
                     {(autoKospi !== null || autoOptPrice !== null) && (
                       <View style={{flexDirection:'row', gap:20, marginTop:8}}>
@@ -1503,6 +1533,7 @@ const OrderScreen = () => {
                       {text: '취소', style: 'cancel'},
                       {text: '중지', style: 'destructive', onPress: () => {
                         if (autoIntervalRef.current) { clearInterval(autoIntervalRef.current); autoIntervalRef.current = null; }
+                        stopBackgroundService().then(() => setBgRunning(false)).catch(() => {});
                         setAutoStatus('idle');
                         addLog('사용자가 모니터링을 중지했습니다');
                       }},
@@ -1626,6 +1657,7 @@ const OrderScreen = () => {
                           {text: '취소', style: 'cancel'},
                           {text: '중지', style: 'destructive', onPress: () => {
                             if (autoIntervalRef.current) { clearInterval(autoIntervalRef.current); autoIntervalRef.current = null; }
+                            stopBackgroundService().then(() => setBgRunning(false)).catch(() => {});
                             setAutoStatus('idle');
                             addLog('사용자가 모니터링을 중지했습니다');
                           }},

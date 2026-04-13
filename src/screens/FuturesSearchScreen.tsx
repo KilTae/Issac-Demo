@@ -26,7 +26,7 @@ const fmt2 = (n: number) => Number(n).toFixed(2);
 const ROW_HEIGHT = 34;
 
 type MainTab    = '주간' | '야간';
-type ProductTab = 'KP200' | '위클리';
+type ProductTab = 'KP200' | '위클리' | 'KQ150';
 type WeekDay    = '목' | '월';
 type KP200Sub   = '월물' | '스프레드';
 
@@ -37,7 +37,7 @@ interface OptionRow  {
 }
 interface SearchItem {
   shcode: string; hname: string; yyyymm: string;
-  type: '콜' | '풋' | '선물' | '위클리콜' | '위클리풋';
+  type: '콜' | '풋' | '선물' | '위클리콜' | '위클리풋' | 'KQ150콜' | 'KQ150풋' | 'KQ150선물';
   strike: number; price: number; chg: number; sign: string;
 }
 
@@ -51,7 +51,7 @@ const getArrow = (sign: string) => {
   if (sign === '4' || sign === '5') return '▼';
   return '';
 };
-// 해당 요일(0=일,1=월,...,6=토)의 이번 달 n번째 날짜 반환
+
 const getNthWeekdayOfMonth = (year: number, month: number, dow: number, n: number): Date => {
   let count = 0;
   for (let d = 1; d <= 31; d++) {
@@ -62,29 +62,22 @@ const getNthWeekdayOfMonth = (year: number, month: number, dow: number, n: numbe
       if (count === n) return date;
     }
   }
-  return new Date(year, month, 1); // fallback
+  return new Date(year, month, 1);
 };
 
-// 오늘 이후 가장 가까운 위클리 만기 2개를 날짜순으로 반환
-// 위클리 만기: 매주 월요일(dow=1) + 목요일(dow=4)
 const getNextWeeklyExpiries = (): {
   tabs: { day: WeekDay; label: string }[];
   defaultDay: WeekDay;
 } => {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
-
   const y = today.getFullYear();
   const m = today.getMonth();
-
   const candidates: { date: Date; label: string; day: WeekDay }[] = [];
-
-  // 이번 달 + 다음 달까지 탐색
   for (let mo = 0; mo <= 1; mo++) {
     const cm = m + mo;
     const cy = cm > 11 ? y + 1 : y;
     const rm = cm % 12;
-
     for (const dow of [1, 4]) {
       let weekN = 0;
       for (let d = 1; d <= 31; d++) {
@@ -103,13 +96,13 @@ const getNextWeeklyExpiries = (): {
       }
     }
   }
-
   candidates.sort((a, b) => a.date.getTime() - b.date.getTime());
   const next2 = candidates.slice(0, 2);
   const tabs = next2.map(c => ({ day: c.day, label: c.label }));
   return { tabs, defaultDay: tabs[0]?.day ?? '월' };
 };
 
+// ── KP200 선물 월물 생성 (분기물: 3/6/9/12월) ────────────────────────────────
 const generateKP200Months = (): MonthItem[] => {
   const today = new Date();
   let y = today.getFullYear();
@@ -130,17 +123,74 @@ const generateKP200Months = (): MonthItem[] => {
   }
   return result;
 };
+
+// ── KQ150 선물 월물 생성 (분기물: 3/6/9/12월) ────────────────────────────────
+// KQ150 선물 종목코드: KQF YYMM 형식, shcode = 'A5'로 시작하는 코드 사용
+// LS API 기준 KQ150 선물 gubun='Q', shcode 예: KQF 2606 → 실제 코드는 A500{monthCode}000
+const generateKQ150Months = (): MonthItem[] => {
+  const today = new Date();
+  let y = today.getFullYear();
+  let m = today.getMonth() + 1;
+  const quarters = [3, 6, 9, 12];
+  const result: MonthItem[] = [];
+  while (result.length < 4) {
+    const next = quarters.find(q => q >= m) ?? quarters[0];
+    if (next < m) y += 1;
+    m = next;
+    const yy = String(y).slice(2);
+    const mm = String(m).padStart(2, '0');
+    const monthCode = m <= 9 ? String(m) : String.fromCharCode(55 + m);
+    result.push({ label: `KQF ${yy}${mm}`, shcode: `A500${monthCode}000`, yyyymm: `${y}${mm}` });
+    const idx = quarters.indexOf(m);
+    if (idx === quarters.length - 1) { m = quarters[0]; y += 1; }
+    else { m = quarters[idx + 1]; }
+  }
+  return result;
+};
+
+// KP200 옵션 만기: 매월 두 번째 목요일
 const generateExpiryMonths = (): string[] => {
   const today = new Date();
-  return Array.from({length: 4}, (_, i) => {
-    const d = new Date(today.getFullYear(), today.getMonth() + i, 1);
-    return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}`;
-  });
+  today.setHours(0, 0, 0, 0);
+  const getSecondThursday = (y: number, m: number): Date => {
+    let count = 0;
+    for (let d = 1; d <= 31; d++) {
+      const date = new Date(y, m, d);
+      if (date.getMonth() !== m) break;
+      if (date.getDay() === 4) {
+        count++;
+        if (count === 2) return date;
+      }
+    }
+    return new Date(y, m + 1, 1);
+  };
+  const result: string[] = [];
+  let y = today.getFullYear();
+  let m = today.getMonth();
+  const thisExpiry = getSecondThursday(y, m);
+  if (today > thisExpiry) {
+    m += 1;
+    if (m > 11) { m = 0; y += 1; }
+  }
+  while (result.length < 4) {
+    const mm = String(m + 1).padStart(2, '0');
+    result.push(`${y}${mm}`);
+    m += 1;
+    if (m > 11) { m = 0; y += 1; }
+  }
+  return result;
 };
+
 const generateFuturesSearchItems = (): SearchItem[] =>
   generateKP200Months().map(m => ({
     shcode: m.shcode, hname: m.label, yyyymm: m.yyyymm,
     type: '선물' as const, strike: 0, price: 0, chg: 0, sign: '3',
+  }));
+
+const generateKQ150FuturesSearchItems = (): SearchItem[] =>
+  generateKQ150Months().map(m => ({
+    shcode: m.shcode, hname: m.label, yyyymm: m.yyyymm,
+    type: 'KQ150선물' as const, strike: 0, price: 0, chg: 0, sign: '3',
   }));
 
 // ── 메인 ─────────────────────────────────────────────────────────────────────
@@ -151,24 +201,35 @@ const FuturesSearchScreen = () => {
 
   const kp200ScrollRef  = useRef<ScrollView>(null) as React.MutableRefObject<ScrollView>;
   const weeklyScrollRef = useRef<ScrollView>(null) as React.MutableRefObject<ScrollView>;
+  const kq150ScrollRef  = useRef<ScrollView>(null) as React.MutableRefObject<ScrollView>;
   const isFirstMount    = useRef(true);
+  const isFirstKQ150    = useRef(true);
   const searchInputRef  = useRef<TextInput>(null);
 
-  const [mainTab,         setMainTab]         = useState<MainTab>('주간');
-  const [productTab,      setProductTab]      = useState<ProductTab>('KP200');
-  const [kp200Sub,        setKp200Sub]        = useState<KP200Sub>('월물');
-  const [kp200Months,     setKp200Months]     = useState<MonthItem[]>([]);
-  const [expiryMonths,    setExpiryMonths]    = useState<string[]>([]);
-  const [selectedExpiry,  setSelectedExpiry]  = useState<string>('');
-  const [weekDay,         setWeekDay]         = useState<WeekDay>(defaultDay);
-  const [dropdownVisible, setDropdownVisible] = useState(false);
-  const [kp200Rows,       setKp200Rows]       = useState<OptionRow[]>([]);
-  const [kp200Loading,    setKp200Loading]    = useState(false);
-  const [rows,            setRows]            = useState<OptionRow[]>([]);
-  const [allCalls,        setAllCalls]        = useState<any[]>([]);
-  const [allPuts,         setAllPuts]         = useState<any[]>([]);
-  const [gmprice,         setGmprice]         = useState(0);
-  const [loading,         setLoading]         = useState(true);
+  const [mainTab,             setMainTab]             = useState<MainTab>('주간');
+  const [productTab,          setProductTab]          = useState<ProductTab>('KP200');
+  const [kp200Sub,            setKp200Sub]            = useState<KP200Sub>('월물');
+  const [kp200Months,         setKp200Months]         = useState<MonthItem[]>([]);
+  const [expiryMonths,        setExpiryMonths]        = useState<string[]>([]);
+  const [selectedExpiry,      setSelectedExpiry]      = useState<string>('');
+  const [weekDay,             setWeekDay]             = useState<WeekDay>(defaultDay);
+  const [dropdownVisible,     setDropdownVisible]     = useState(false);
+  const [kp200Rows,           setKp200Rows]           = useState<OptionRow[]>([]);
+  const [kp200Loading,        setKp200Loading]        = useState(false);
+  const [rows,                setRows]                = useState<OptionRow[]>([]);
+  const [allCalls,            setAllCalls]            = useState<any[]>([]);
+  const [allPuts,             setAllPuts]             = useState<any[]>([]);
+  const [gmprice,             setGmprice]             = useState(0);
+  const [loading,             setLoading]             = useState(true);
+
+  // ── KQ150 전용 state ──────────────────────────────────────────────────────
+  const [kq150Sub,            setKq150Sub]            = useState<KP200Sub>('월물');
+  const [kq150Months,         setKq150Months]         = useState<MonthItem[]>([]);
+  const [kq150ExpiryMonths,   setKq150ExpiryMonths]   = useState<string[]>([]);
+  const [kq150SelectedExpiry, setKq150SelectedExpiry] = useState<string>('');
+  const [kq150DropdownVisible,setKq150DropdownVisible]= useState(false);
+  const [kq150Rows,           setKq150Rows]           = useState<OptionRow[]>([]);
+  const [kq150Loading,        setKq150Loading]        = useState(false);
 
   // ── 검색 모달 state ──────────────────────────────────────────────────────
   const [searchVisible,  setSearchVisible]  = useState(false);
@@ -182,7 +243,10 @@ const FuturesSearchScreen = () => {
     if (searchFetched) return;
     setSearchLoading(true);
     try {
-      const items: SearchItem[] = [...generateFuturesSearchItems()];
+      const items: SearchItem[] = [
+        ...generateFuturesSearchItems(),
+        ...generateKQ150FuturesSearchItems(),
+      ];
       const expiries = generateExpiryMonths();
       for (const yyyymm of expiries) {
         try {
@@ -199,6 +263,23 @@ const FuturesSearchScreen = () => {
           }));
           await new Promise<void>(r => setTimeout(r, 400));
         } catch (e: any) { console.log(`❌ 옵션 ${yyyymm}:`, e?.message); }
+      }
+      // KQ150 옵션 검색용 로드
+      for (const yyyymm of expiries) {
+        try {
+          const board = await getOptionBoard(yyyymm, 'Q');
+          board.calls.forEach(c => items.push({
+            shcode: c.optcode, hname: `KQ C ${yyyymm} ${c.actprice}`,
+            yyyymm, type: 'KQ150콜', strike: c.actprice,
+            price: c.price, chg: c.change, sign: c.sign ?? '3',
+          }));
+          board.puts.forEach(p => items.push({
+            shcode: p.optcode, hname: `KQ P ${yyyymm} ${p.actprice}`,
+            yyyymm, type: 'KQ150풋', strike: p.actprice,
+            price: p.price, chg: p.change, sign: p.sign ?? '3',
+          }));
+          await new Promise<void>(r => setTimeout(r, 400));
+        } catch (e: any) { console.log(`❌ KQ150 옵션 ${yyyymm}:`, e?.message); }
       }
       try {
         const weekly = await getOptionBoard('W1 ', 'W');
@@ -252,11 +333,14 @@ const FuturesSearchScreen = () => {
 
   const getBadge = (type: SearchItem['type']) => {
     switch (type) {
-      case '선물':     return {bg: '#EEF2FF', text: C.navy,    label: 'F'};
-      case '콜':       return {bg: '#EEF2FF', text: C.navy,    label: 'C'};
-      case '풋':       return {bg: '#FFF0F0', text: C.red,     label: 'P'};
-      case '위클리콜': return {bg: '#E8F5E9', text: '#2E7D32', label: 'WC'};
-      case '위클리풋': return {bg: '#FFF3E0', text: '#E65100', label: 'WP'};
+      case '선물':      return {bg: '#EEF2FF', text: C.navy,    label: 'F'};
+      case '콜':        return {bg: '#EEF2FF', text: C.navy,    label: 'C'};
+      case '풋':        return {bg: '#FFF0F0', text: C.red,     label: 'P'};
+      case '위클리콜':  return {bg: '#E8F5E9', text: '#2E7D32', label: 'WC'};
+      case '위클리풋':  return {bg: '#FFF3E0', text: '#E65100', label: 'WP'};
+      case 'KQ150선물': return {bg: '#F3E5F5', text: '#6A1B9A', label: 'KQF'};
+      case 'KQ150콜':   return {bg: '#EDE7F6', text: '#4527A0', label: 'QC'};
+      case 'KQ150풋':   return {bg: '#FCE4EC', text: '#880E4F', label: 'QP'};
     }
   };
 
@@ -273,13 +357,16 @@ const FuturesSearchScreen = () => {
           <View>
             <Text style={s.searchItemName}>{item.hname}</Text>
             <Text style={s.searchItemSub}>
-              {item.type === '선물' ? 'KP200 선물' :
-               item.yyyymm === 'W1 ' ? '위클리 옵션' :
+              {item.type === '선물'      ? 'KP200 선물' :
+               item.type === 'KQ150선물' ? 'KQ150 선물' :
+               item.type === 'KQ150콜'  ? `KQ150 옵션 · ${item.yyyymm}` :
+               item.type === 'KQ150풋'  ? `KQ150 옵션 · ${item.yyyymm}` :
+               item.yyyymm === 'W1 '    ? '위클리 옵션' :
                `KP200 옵션 · ${item.yyyymm}`}
             </Text>
           </View>
         </View>
-        {item.type !== '선물' && (
+        {item.type !== '선물' && item.type !== 'KQ150선물' && (
           <View style={s.searchItemRight}>
             <Text style={[s.searchItemPrice, {color}]}>{fmt2(item.price)}</Text>
             {item.chg !== 0 && (
@@ -291,7 +378,7 @@ const FuturesSearchScreen = () => {
     );
   };
 
-  // ── 옵션전광판 ────────────────────────────────────────────────────────────
+  // ── 옵션전광판 공통 ────────────────────────────────────────────────────────
   const scrollToATM = useCallback((boardRows: OptionRow[], ref: React.MutableRefObject<ScrollView>) => {
     const atmIdx = boardRows.findIndex(r => r.atm);
     if (atmIdx <= 0) return;
@@ -309,6 +396,7 @@ const FuturesSearchScreen = () => {
     }));
   }, []);
 
+  // ── KP200 ─────────────────────────────────────────────────────────────────
   const fetchKP200Options = useCallback(async (yyyymm: string) => {
     setKp200Loading(true);
     try {
@@ -334,11 +422,37 @@ const FuturesSearchScreen = () => {
     await fetchKP200Options(expiries[0]);
   }, [fetchKP200Options]);
 
-  // 위클리 캐시 (탭 전환 시 재호출 방지)
+  // ── KQ150 ─────────────────────────────────────────────────────────────────
+  const fetchKQ150Options = useCallback(async (yyyymm: string) => {
+    setKq150Loading(true);
+    try {
+      const board = await getOptionBoard(yyyymm, 'Q');
+      const map = new Map<number, {call?: any; put?: any}>();
+      board.calls.forEach(c => map.set(c.actprice, {...(map.get(c.actprice) ?? {}), call: c}));
+      board.puts.forEach(p  => map.set(p.actprice, {...(map.get(p.actprice) ?? {}), put:  p}));
+      const newRows = buildRowsFromMap(map, board.summary.gmprice);
+      setKq150Rows(newRows);
+      scrollToATM(newRows, kq150ScrollRef);
+    } catch (e: any) {
+      console.log('❌ KQ150 조회 실패:', e?.message);
+    } finally {
+      setKq150Loading(false);
+    }
+  }, [buildRowsFromMap, scrollToATM]);
+
+  const fetchKQ150Init = useCallback(async () => {
+    setKq150Months(generateKQ150Months());
+    const expiries = generateExpiryMonths();
+    setKq150ExpiryMonths(expiries);
+    setKq150SelectedExpiry(expiries[0]);
+    await fetchKQ150Options(expiries[0]);
+  }, [fetchKQ150Options]);
+
+  // ── 위클리 ────────────────────────────────────────────────────────────────
   const weeklyCacheRef = useRef<Partial<Record<WeekDay, {
     calls: any[]; puts: any[]; gmprice: number; ts: number;
   }>>>({});
-  const CACHE_TTL_MS = 60_000; // 1분간 캐시 유지
+  const CACHE_TTL_MS = 60_000;
 
   const buildWeeklyRows = useCallback((calls: any[], puts: any[], gmp: number) => {
     const map = new Map<number, {call?: any; put?: any}>();
@@ -350,7 +464,6 @@ const FuturesSearchScreen = () => {
   }, [buildRowsFromMap, scrollToATM]);
 
   const fetchWeekly = useCallback(async (day: WeekDay, retry = 0) => {
-    // 캐시 확인
     const cached = weeklyCacheRef.current[day];
     if (cached && Date.now() - cached.ts < CACHE_TTL_MS) {
       setGmprice(cached.gmprice);
@@ -359,16 +472,9 @@ const FuturesSearchScreen = () => {
       buildWeeklyRows(cached.calls, cached.puts, cached.gmprice);
       return;
     }
-
     setLoading(true);
     try {
       const board = await getWeeklyOptionBoard(day);
-      // 캐시 저장
-
-          console.log(`[위클리 ${day}] yyyymm: ${day === '월' ? 'W1 ' : 'W2 '}`);
-    console.log(`[위클리 ${day}] 콜 첫 번째 optcode:`, board.calls[0]?.optcode);
-    console.log(`[위클리 ${day}] 풋 첫 번째 optcode:`, board.puts[0]?.optcode);
-    console.log(`[위클리 ${day}] 잔존일:`, board.summary.jandatecnt);
       weeklyCacheRef.current[day] = {
         calls: board.calls, puts: board.puts,
         gmprice: board.summary.gmprice, ts: Date.now(),
@@ -379,10 +485,8 @@ const FuturesSearchScreen = () => {
       buildWeeklyRows(board.calls, board.puts, board.summary.gmprice);
     } catch (e: any) {
       const msg: string = e?.message ?? '';
-      // 거래건수 초과 → 최대 3회 재시도 (1s, 2s, 3s 딜레이)
       if (msg.includes('초과') && retry < 3) {
         const delay = (retry + 1) * 1000;
-        console.log(`⚠️ 위클리(${day}) 거래건수 초과 — ${delay/1000}초 후 재시도 (${retry + 1}/3)`);
         setTimeout(() => fetchWeekly(day, retry + 1), delay);
       } else {
         console.log(`❌ 위클리(${day}) 조회 실패:`, msg);
@@ -412,12 +516,25 @@ const FuturesSearchScreen = () => {
     if (allCalls.length > 0 || allPuts.length > 0) buildWeeklyRows(allCalls, allPuts, gmprice);
   }, [allCalls, allPuts, gmprice, buildWeeklyRows]);
 
-  // weekDay 바뀌면 해당 만기 위클리 조회 (700ms 딜레이로 연속 호출 방지)
   useEffect(() => {
     if (productTab !== '위클리') return;
     const timer = setTimeout(() => fetchWeekly(weekDay), 700);
     return () => clearTimeout(timer);
   }, [weekDay]);
+
+  // KQ150 탭 처음 진입 시 데이터 로드
+  useEffect(() => {
+    if (productTab !== 'KQ150') return;
+    if (isFirstKQ150.current) {
+      isFirstKQ150.current = false;
+      fetchKQ150Init();
+    }
+  }, [productTab]);
+
+  useEffect(() => {
+    if (isFirstKQ150.current) return;
+    if (kq150SelectedExpiry) fetchKQ150Options(kq150SelectedExpiry);
+  }, [kq150SelectedExpiry]);
 
   const handleWeeklySelect = useCallback((optcode: string, strike: number, type: 'C' | 'P') => {
     if (!optcode) return;
@@ -442,7 +559,7 @@ const FuturesSearchScreen = () => {
     </View>
   );
 
-  const renderRows = (boardRows: OptionRow[], isWeekly: boolean) =>
+  const renderRows = (boardRows: OptionRow[], isWeekly: boolean, prefix?: string) =>
     boardRows.map((r, i) => {
       const callArrow    = getArrow(r.callSign);
       const putArrow     = getArrow(r.putSign);
@@ -450,6 +567,18 @@ const FuturesSearchScreen = () => {
                          : (r.callSign === '4' || r.callSign === '5') ? C.blue : '#333';
       const putChgColor  = (r.putSign  === '1' || r.putSign  === '2') ? C.red
                          : (r.putSign  === '4' || r.putSign  === '5') ? C.blue : '#333';
+      const callHname = prefix
+        ? `${prefix} C ${r.strike}`
+        : isWeekly
+          ? `C ${weeklyTabs.find(t => t.day === weekDay)?.label ?? weekDay} ${fmt2(r.strike)}`
+          : `C ${selectedExpiry} ${r.strike}`;
+      const putHname = prefix
+        ? `${prefix} P ${r.strike}`
+        : isWeekly
+          ? `P ${weeklyTabs.find(t => t.day === weekDay)?.label ?? weekDay} ${fmt2(r.strike)}`
+          : `P ${selectedExpiry} ${r.strike}`;
+      const callYyyymm = prefix ? kq150SelectedExpiry : isWeekly ? (weekDay === '월' ? 'W1 ' : 'W2 ') : selectedExpiry;
+      const putYyyymm  = callYyyymm;
       return (
         <View key={i} style={[s.row, r.atm && s.rowATM]}>
           <View style={s.cell}>
@@ -460,7 +589,7 @@ const FuturesSearchScreen = () => {
           <TouchableOpacity style={s.cell} activeOpacity={0.7}
             onPress={() => isWeekly
               ? handleWeeklySelect(r.callOptcode, r.strike, 'C')
-              : navigation.navigate('FuturesOption', {shcode: r.callOptcode, hname: `C ${selectedExpiry} ${r.strike}`, yyyymm: selectedExpiry})}>
+              : navigation.navigate('FuturesOption', {shcode: r.callOptcode, hname: callHname, yyyymm: callYyyymm})}>
             <Text style={[s.priceText, {textAlign:'center', color: callChgColor}]}>{fmt2(r.call)}</Text>
           </TouchableOpacity>
           <View style={s.strikeCell}>
@@ -469,7 +598,7 @@ const FuturesSearchScreen = () => {
           <TouchableOpacity style={s.cell} activeOpacity={0.7}
             onPress={() => isWeekly
               ? handleWeeklySelect(r.putOptcode, r.strike, 'P')
-              : navigation.navigate('FuturesOption', {shcode: r.putOptcode, hname: `P ${selectedExpiry} ${r.strike}`, yyyymm: selectedExpiry})}>
+              : navigation.navigate('FuturesOption', {shcode: r.putOptcode, hname: putHname, yyyymm: putYyyymm})}>
             <Text style={[s.priceText, {textAlign:'center', color: putChgColor}]}>{fmt2(r.put)}</Text>
           </TouchableOpacity>
           <View style={s.cell}>
@@ -502,8 +631,9 @@ const FuturesSearchScreen = () => {
         ))}
       </View>
 
+      {/* ── 상품 탭 (KP200 / 위클리 / KQ150) ── */}
       <View style={s.productTabRow}>
-        {(['KP200', '위클리'] as ProductTab[]).map(t => (
+        {(['KP200', '위클리', 'KQ150'] as ProductTab[]).map(t => (
           <TouchableOpacity key={t} onPress={() => setProductTab(t)} activeOpacity={0.8}
             style={[s.productTabBtn, productTab === t && s.productTabBtnActive]}>
             <Text style={[s.productTabText, productTab === t && s.productTabTextActive]}>{t}</Text>
@@ -597,6 +727,65 @@ const FuturesSearchScreen = () => {
         </>
       )}
 
+      {/* ════ KQ150 탭 ════ */}
+      {productTab === 'KQ150' && (
+        <>
+          <View style={s.kp200SubTabRow}>
+            {(['월물','스프레드'] as KP200Sub[]).map(t => (
+              <TouchableOpacity key={t} onPress={() => setKq150Sub(t)} activeOpacity={0.8} style={s.kp200SubTabBtn}>
+                <Text style={[s.kp200SubTabText, kq150Sub === t && s.kp200SubTabTextActive]}>{t}</Text>
+                {kq150Sub === t && <View style={s.kp200SubTabUnderline}/>}
+              </TouchableOpacity>
+            ))}
+          </View>
+
+          {kq150Sub === '월물' && (
+            <View style={s.monthRow}>
+              {kq150Months.map(m => (
+                <TouchableOpacity key={m.shcode} activeOpacity={0.4} style={s.monthBtn}
+                  onPress={() => navigation.navigate('FuturesOption', {shcode: m.shcode, hname: m.label, yyyymm: m.yyyymm})}>
+                  <Text style={s.monthBtnText}>{m.label}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          )}
+
+          <TouchableOpacity style={s.expiryRow} activeOpacity={0.7} onPress={() => setKq150DropdownVisible(true)}>
+            <Text style={s.expiryLabel}>만기월</Text>
+            <View style={s.expiryDropdown}>
+              <Text style={s.expiryDropdownText}>{kq150SelectedExpiry || '-'}</Text>
+              <Text style={s.expiryDropdownArrow}>▾</Text>
+            </View>
+          </TouchableOpacity>
+
+          <Modal visible={kq150DropdownVisible} transparent animationType="fade" onRequestClose={() => setKq150DropdownVisible(false)}>
+            <TouchableOpacity style={s.dropdownOverlay} activeOpacity={1} onPress={() => setKq150DropdownVisible(false)}>
+              <View style={s.dropdownMenu}>
+                <Text style={s.dropdownTitle}>만기월 선택</Text>
+                {kq150ExpiryMonths.map(ym => (
+                  <TouchableOpacity key={ym} style={[s.dropdownItem, kq150SelectedExpiry === ym && s.dropdownItemActive]}
+                    activeOpacity={0.7} onPress={() => { setKq150SelectedExpiry(ym); setKq150DropdownVisible(false); }}>
+                    <Text style={[s.dropdownItemText, kq150SelectedExpiry === ym && s.dropdownItemTextActive]}>{ym}</Text>
+                    {kq150SelectedExpiry === ym && <Text style={s.dropdownCheck}>✓</Text>}
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </TouchableOpacity>
+          </Modal>
+
+          <ColHeader/>
+          {kq150Loading ? (
+            <View style={s.loadingWrap}><ActivityIndicator size="large" color={C.navy}/><Text style={s.loadingText}>KQ150 조회 중...</Text></View>
+          ) : (
+            <ScrollView ref={kq150ScrollRef} showsVerticalScrollIndicator={false}>
+              {kq150Rows.length === 0
+                ? <View style={s.loadingWrap}><Text style={s.loadingText}>데이터가 없습니다</Text></View>
+                : renderRows(kq150Rows, false, 'KQ')}
+            </ScrollView>
+          )}
+        </>
+      )}
+
       {/* ════ 검색 모달 ════ */}
       <Modal visible={searchVisible} animationType="slide" onRequestClose={closeSearch}>
         <SafeAreaView style={s.container} edges={['top']}>
@@ -610,7 +799,7 @@ const FuturesSearchScreen = () => {
               <TextInput
                 ref={searchInputRef}
                 style={s.searchInput}
-                placeholder="종목명·행사가 검색   예) C 202604, 800"
+                placeholder="종목명·행사가 검색   예) KQ C 202604, 800"
                 placeholderTextColor={C.dimText}
                 value={searchQuery}
                 onChangeText={setSearchQuery}
@@ -625,7 +814,7 @@ const FuturesSearchScreen = () => {
             <View style={s.loadingWrap}>
               <ActivityIndicator size="large" color={C.navy}/>
               <Text style={s.loadingText}>전체 종목 불러오는 중...</Text>
-              <Text style={[s.loadingText, {fontSize:12, color:C.dimText}]}>KP200 옵션 4개월 + 위클리</Text>
+              <Text style={[s.loadingText, {fontSize:12, color:C.dimText}]}>KP200 + KQ150 옵션 4개월 + 위클리</Text>
             </View>
           )}
 
@@ -633,11 +822,12 @@ const FuturesSearchScreen = () => {
             <View style={s.guideWrap}>
               <Text style={s.guideTitle}>이렇게 검색해보세요</Text>
               {[
-                ['F 2606',   'KP200 선물 2026년 6월물'],
-                ['C 202604', 'KP200 콜옵션 4월'],
-                ['P 202606', 'KP200 풋옵션 6월'],
-                ['WC',       '위클리 콜옵션'],
-                ['800',      '행사가 800 전종목'],
+                ['F 2606',      'KP200 선물 2026년 6월물'],
+                ['KQF 2606',    'KQ150 선물 2026년 6월물'],
+                ['C 202604',    'KP200 콜옵션 4월'],
+                ['KQ C 202604', 'KQ150 콜옵션 4월'],
+                ['WC',          '위클리 콜옵션'],
+                ['800',         '행사가 800 전종목'],
               ].map(([ex, desc]) => (
                 <TouchableOpacity key={ex} style={s.guideRow} onPress={() => setSearchQuery(ex)} activeOpacity={0.6}>
                   <Text style={s.guideEx}>{ex}</Text>
@@ -687,8 +877,8 @@ const s = StyleSheet.create({
   mainTabBtnActive:      {borderBottomColor:C.navy},
   mainTabText:           {fontSize:15, fontWeight:'400', color:C.subText},
   mainTabTextActive:     {fontWeight:'700', color:C.navy},
-  productTabRow:         {flexDirection:'row', gap:8, paddingHorizontal:14, paddingVertical:12, borderBottomWidth:1, borderBottomColor:C.border},
-  productTabBtn:         {paddingHorizontal:20, paddingVertical:8, borderRadius:24, borderWidth:1.5, borderColor:'#DDD', backgroundColor:C.bg},
+  productTabRow:         {flexDirection:'row', alignItems:'center', gap:6, paddingHorizontal:14, paddingVertical:10, borderBottomWidth:1, borderBottomColor:C.border},
+  productTabBtn:         {paddingHorizontal:16, paddingVertical:7, borderRadius:24, borderWidth:1.5, borderColor:'#DDD', backgroundColor:C.bg},
   productTabBtnActive:   {backgroundColor:C.navy, borderColor:C.navy},
   productTabText:        {fontSize:13, fontWeight:'500', color:'#555'},
   productTabTextActive:  {color:'#FFFFFF', fontWeight:'700'},
@@ -730,7 +920,6 @@ const s = StyleSheet.create({
   strikeATM:             {fontWeight:'800'},
   loadingWrap:           {paddingVertical:40, alignItems:'center', justifyContent:'center', gap:12},
   loadingText:           {fontSize:14, color:C.subText},
-  // 검색 모달
   searchHeader:          {flexDirection:'row', alignItems:'center', paddingHorizontal:14, paddingVertical:10, borderBottomWidth:1, borderBottomColor:C.border, gap:8},
   searchInputWrap:       {flex:1, flexDirection:'row', alignItems:'center', paddingHorizontal:12, paddingVertical:9, backgroundColor:C.inputBg, borderRadius:12, gap:6},
   searchInputIcon:       {fontSize:14},
@@ -738,7 +927,7 @@ const s = StyleSheet.create({
   guideWrap:             {flex:1, paddingHorizontal:20, paddingTop:24},
   guideTitle:            {fontSize:13, fontWeight:'700', color:C.subText, marginBottom:12},
   guideRow:              {flexDirection:'row', alignItems:'center', gap:12, paddingVertical:12, borderBottomWidth:1, borderBottomColor:'#F5F5F5'},
-  guideEx:               {fontSize:14, fontWeight:'700', color:C.navy, width:100},
+  guideEx:               {fontSize:14, fontWeight:'700', color:C.navy, width:110},
   guideDesc:             {fontSize:13, color:C.subText},
   totalCount:            {marginTop:20, fontSize:12, color:C.dimText, textAlign:'center'},
   resultBar:             {paddingHorizontal:14, paddingVertical:8, backgroundColor:C.rowBg, borderBottomWidth:1, borderBottomColor:C.border},

@@ -8,6 +8,7 @@ import {useNavigation, useRoute, RouteProp} from '@react-navigation/native';
 import {NativeStackNavigationProp} from '@react-navigation/native-stack';
 import {RootStackParamList} from '../navigation/RootNavigator';
 import {SafeAreaView} from 'react-native-safe-area-context';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   getFuturesPrice, getFuturesHoga, getOptionBoard,
   FuturesPrice, FuturesHoga, OptionItem,
@@ -100,7 +101,7 @@ const MiniHoga = ({book, currentPrice, selectedPrice, onSelect, openPrice}: {
               <View style={ms.rowContent}>
                 <View>
                   <Text style={ms.price}>{fmt2(r.price)}</Text>
-                  <Text style={ms.pctText}>{pct}%</Text>
+                  <Text style={[ms.pctText, {color: pct >= 0 ? C.red : C.blue}]}>{pct >= 0 ? '+' : ''}{pct}%</Text>
                 </View>
                 <Text style={ms.qty}>{r.qty}</Text>
               </View>
@@ -221,6 +222,29 @@ const FuturesOptionScreen = () => {
   const shcode = route.params.shcode;
   const hname  = route.params.hname;
   const yyyymm = route.params.yyyymm ?? '';
+
+  const RECENT_KEY = 'recentFuturesOptions';
+  const [recentVisible,  setRecentVisible]  = useState(false);
+  const [recentItems,    setRecentItems]    = useState<{shcode:string; hname:string; yyyymm:string}[]>([]);
+
+  // 최근 종목 불러오기
+  useEffect(() => {
+    AsyncStorage.getItem(RECENT_KEY).then(val => {
+      if (val) setRecentItems(JSON.parse(val));
+    });
+  }, []);
+
+  // 현재 종목 최근 목록에 저장
+  useEffect(() => {
+    if (!shcode || !hname) return;
+    AsyncStorage.getItem(RECENT_KEY).then(val => {
+      const list: {shcode:string; hname:string; yyyymm:string}[] = val ? JSON.parse(val) : [];
+      const filtered = list.filter(i => i.shcode !== shcode);
+      const updated  = [{shcode, hname, yyyymm}, ...filtered].slice(0, 20);
+      setRecentItems(updated);
+      AsyncStorage.setItem(RECENT_KEY, JSON.stringify(updated));
+    });
+  }, [shcode]);
 
   const [futuresData, setFuturesData] = useState<FuturesPrice | null>(null);
   const [hogaData,    setHogaData]    = useState<FuturesHoga | null>(null);
@@ -348,7 +372,9 @@ const FuturesOptionScreen = () => {
           </TouchableOpacity>
           {/* ✅ displayName 사용 */}
           <Text style={sc.headerTitle}>{displayName}</Text>
-          <View style={sc.headerTriangle}/>
+          <TouchableOpacity onPress={() => setRecentVisible(true)} hitSlop={{top:12,bottom:12,left:12,right:12}}>
+            <View style={sc.headerTriangle}/>
+          </TouchableOpacity>
         </View>
         <View style={sc.headerRight}>
           <View style={sc.dayToggle}>
@@ -359,7 +385,7 @@ const FuturesOptionScreen = () => {
               <Text style={sc.dayBtnText}>야간</Text>
             </View>
           </View>
-          <TouchableOpacity onPress={() => navigation.navigate('FuturesSearch')} hitSlop={{top:12,bottom:12,left:12,right:12}}>
+          <TouchableOpacity onPress={() => navigation.navigate('Main', {screen: 'Search'} as any)} hitSlop={{top:12,bottom:12,left:12,right:12}}>
             <Svg width={22} height={22} viewBox="0 0 24 24" fill="none">
               <Circle cx={10} cy={10} r={6.5} stroke="#111" strokeWidth={2} strokeLinecap="round"/>
               <Path d="M15.5 15.5L21 21" stroke="#111" strokeWidth={2} strokeLinecap="round"/>
@@ -370,6 +396,56 @@ const FuturesOptionScreen = () => {
           </View>
         </View>
       </View>
+
+      {/* ── 최근 조회 종목 바텀시트 ── */}
+      <Modal visible={recentVisible} transparent animationType="slide" onRequestClose={() => setRecentVisible(false)}>
+        <TouchableOpacity style={{flex:1, backgroundColor:'rgba(0,0,0,0.4)'}} activeOpacity={1} onPress={() => setRecentVisible(false)}/>
+        <View style={{backgroundColor:'#FFF', borderTopLeftRadius:16, borderTopRightRadius:16, maxHeight:'70%', paddingBottom:30}}>
+          {/* 핸들 */}
+          <View style={{alignItems:'center', paddingTop:10, paddingBottom:6}}>
+            <View style={{width:36, height:4, borderRadius:2, backgroundColor:'#DDD'}}/>
+          </View>
+          {/* 헤더 */}
+          <View style={{flexDirection:'row', justifyContent:'space-between', alignItems:'center', paddingHorizontal:20, paddingBottom:12}}>
+            <Text style={{fontSize:17, fontWeight:'800', color:'#111'}}>최근 조회 종목</Text>
+            <TouchableOpacity onPress={() => {
+              setRecentItems([]);
+              AsyncStorage.removeItem(RECENT_KEY);
+            }}>
+              <Text style={{fontSize:13, color:'#888', fontWeight:'600'}}>전체 삭제</Text>
+            </TouchableOpacity>
+          </View>
+          {/* 목록 */}
+          <ScrollView>
+            {recentItems.length === 0 ? (
+              <View style={{alignItems:'center', paddingVertical:40}}>
+                <Text style={{color:'#AAA', fontSize:14}}>최근 조회 종목이 없습니다</Text>
+              </View>
+            ) : recentItems.map((item, idx) => (
+              <View key={item.shcode} style={{flexDirection:'row', alignItems:'center', paddingHorizontal:20, paddingVertical:14, borderBottomWidth:1, borderBottomColor:'#F5F5F5'}}>
+                <TouchableOpacity
+                  style={{flex:1}}
+                  onPress={() => {
+                    setRecentVisible(false);
+                    navigation.replace('FuturesOption', {shcode: item.shcode, hname: item.hname, yyyymm: item.yyyymm});
+                  }}>
+                  <Text style={{fontSize:15, fontWeight:'700', color:'#111'}}>{item.hname}</Text>
+                  <Text style={{fontSize:12, color:'#888', marginTop:2}}>{item.shcode}</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  hitSlop={{top:10,bottom:10,left:10,right:10}}
+                  onPress={() => {
+                    const updated = recentItems.filter(i => i.shcode !== item.shcode);
+                    setRecentItems(updated);
+                    AsyncStorage.setItem(RECENT_KEY, JSON.stringify(updated));
+                  }}>
+                  <Text style={{fontSize:18, color:'#BBB', fontWeight:'300'}}>×</Text>
+                </TouchableOpacity>
+              </View>
+            ))}
+          </ScrollView>
+        </View>
+      </Modal>
 
       {/* ── 현재가 영역 ── */}
       <View style={sc.priceSection}>
@@ -420,13 +496,14 @@ const FuturesOptionScreen = () => {
           </View>
           {[...book.asks].reverse().map((r, i) => {
             const p2 = +((r.price-openPrice)/openPrice*100).toFixed(2);
+            const pColor = p2 >= 0 ? C.red : C.blue;
             return (
               <TouchableOpacity key={i} activeOpacity={0.7}
                 onPress={() => setHogaPopup({price: r.price, pct: p2})} style={sc.hogaRow}>
                 <Text style={[sc.hogaQty, {color: C.blue}]}>{r.qty}</Text>
                 <View style={sc.hogaCenter}>
-                  <Text style={sc.hogaPrice}>{fmt2(r.price)}</Text>
-                  <Text style={sc.hogaPct}>{p2}%</Text>
+                  <Text style={[sc.hogaPrice, {color: pColor}]}>{fmt2(r.price)}</Text>
+                  <Text style={[sc.hogaPct, {color: pColor}]}>{p2 >= 0 ? '+' : ''}{p2}%</Text>
                 </View>
                 <View style={{flex: 1}}/>
               </TouchableOpacity>
@@ -442,13 +519,14 @@ const FuturesOptionScreen = () => {
           </View>
           {book.bids.map((r, i) => {
             const p2 = +((r.price-openPrice)/openPrice*100).toFixed(2);
+            const pColor = p2 >= 0 ? C.red : C.blue;
             return (
               <TouchableOpacity key={i} activeOpacity={0.7}
                 onPress={() => setHogaPopup({price: r.price, pct: p2})} style={sc.hogaRow}>
                 <View style={{flex: 1}}/>
                 <View style={sc.hogaCenter}>
-                  <Text style={sc.hogaPrice}>{fmt2(r.price)}</Text>
-                  <Text style={sc.hogaPct}>{p2}%</Text>
+                  <Text style={[sc.hogaPrice, {color: pColor}]}>{fmt2(r.price)}</Text>
+                  <Text style={[sc.hogaPct, {color: pColor}]}>{p2 >= 0 ? '+' : ''}{p2}%</Text>
                 </View>
                 <Text style={[sc.hogaQty, {textAlign: 'left'}]}>{r.qty}</Text>
               </TouchableOpacity>

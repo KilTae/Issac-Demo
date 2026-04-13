@@ -1,6 +1,7 @@
 import React from 'react';
 import {createBottomTabNavigator} from '@react-navigation/bottom-tabs';
 import {View, Text, TouchableOpacity, StyleSheet, Platform} from 'react-native';
+import Svg, {Circle, Path} from 'react-native-svg';
 import AccountScreen from '../screens/AccountScreen';
 import AccountBalanceScreen from '../screens/AccountBalanceScreen';
 import FuturesSearchScreen from '../screens/FuturesSearchScreen';
@@ -8,29 +9,15 @@ import FuturesSearchScreen from '../screens/FuturesSearchScreen';
 const Tab = createBottomTabNavigator();
 
 const TABS = [
-  {name: 'Home',        label: '홈',        icon: 'home'},
-  {name: 'Balance',     label: '잔고',      icon: 'balance'},
-  {name: 'OptionBoard', label: '옵션전광판', icon: 'board'},
-  {name: 'Account',     label: '설정',      icon: 'account'},
+  {name: 'Balance', label: '잔고',  icon: 'balance'},
+  {name: 'Search',  label: '검색',  icon: 'search'},
+  {name: 'Account', label: '설정',  icon: 'account'},
 ];
 
 const TabIcon = ({name, active}: {name: string; active: boolean}) => {
   const color = active ? '#2A3A6A' : '#BBBBBB';
   const size  = 22;
 
-  if (name === 'home') {
-    return (
-      <View style={{width: size, height: size, alignItems: 'center', justifyContent: 'center'}}>
-        <View style={{
-          width: 0, height: 0,
-          borderLeftWidth: 11, borderRightWidth: 11, borderBottomWidth: 9,
-          borderLeftColor: 'transparent', borderRightColor: 'transparent',
-          borderBottomColor: color, marginBottom: -1,
-        }}/>
-        <View style={{width: 14, height: 10, backgroundColor: color, borderRadius: 1}}/>
-      </View>
-    );
-  }
   if (name === 'balance') {
     return (
       <View style={{width: size, height: size, flexDirection: 'row', alignItems: 'flex-end', gap: 3}}>
@@ -40,14 +27,12 @@ const TabIcon = ({name, active}: {name: string; active: boolean}) => {
       </View>
     );
   }
-  if (name === 'board') {
+  if (name === 'search') {
     return (
-      <View style={{width: size, height: size, alignItems: 'center', justifyContent: 'center'}}>
-        <View style={{width: 20, height: 15, borderRadius: 3, borderWidth: 1.5, borderColor: color, alignItems: 'flex-start', justifyContent: 'center', padding: 3, gap: 3}}>
-          <View style={{width: 12, height: 1.5, backgroundColor: color, borderRadius: 1}}/>
-          <View style={{width: 8,  height: 1.5, backgroundColor: color, borderRadius: 1}}/>
-        </View>
-      </View>
+      <Svg width={22} height={22} viewBox="0 0 24 24" fill="none">
+        <Circle cx={10} cy={10} r={6.5} stroke={color} strokeWidth={2} strokeLinecap="round"/>
+        <Path d="M15.5 15.5L21 21" stroke={color} strokeWidth={2} strokeLinecap="round"/>
+      </Svg>
     );
   }
   if (name === 'account') {
@@ -86,10 +71,9 @@ const BottomTabNavigator = () => (
     initialRouteName="Balance"
     tabBar={props => <CustomTabBar {...props}/>}
     screenOptions={{headerShown: false}}>
-    <Tab.Screen name="Home"        component={FuturesSearchScreen}/>
-    <Tab.Screen name="Balance"     component={AccountBalanceScreen}/>
-    <Tab.Screen name="OptionBoard" component={AccountScreen}/>
-    <Tab.Screen name="Account"     component={AccountScreen}/>
+    <Tab.Screen name="Balance" component={AccountBalanceScreen}/>
+    <Tab.Screen name="Search"  component={FuturesSearchScreen}/>
+    <Tab.Screen name="Account" component={AccountScreen}/>
   </Tab.Navigator>
 );
 
