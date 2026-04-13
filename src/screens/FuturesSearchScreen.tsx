@@ -7,7 +7,7 @@ import {SafeAreaView} from 'react-native-safe-area-context';
 import {useNavigation} from '@react-navigation/native';
 import {NativeStackNavigationProp} from '@react-navigation/native-stack';
 import {RootStackParamList} from '../navigation/RootNavigator';
-import {getOptionBoard} from '../api/lsApi';
+import {getOptionBoard, getWeeklyOptionBoard} from '../api/lsApi';
 
 const C = {
   bg:      '#FFFFFF',
@@ -51,18 +51,65 @@ const getArrow = (sign: string) => {
   if (sign === '4' || sign === '5') return '▼';
   return '';
 };
-const getWeekNumberByDay = (targetDayOfWeek: number): number => {
-  const today = new Date();
+// 해당 요일(0=일,1=월,...,6=토)의 이번 달 n번째 날짜 반환
+const getNthWeekdayOfMonth = (year: number, month: number, dow: number, n: number): Date => {
   let count = 0;
-  for (let d = 1; d <= today.getDate(); d++) {
-    if (new Date(today.getFullYear(), today.getMonth(), d).getDay() === targetDayOfWeek) count++;
+  for (let d = 1; d <= 31; d++) {
+    const date = new Date(year, month, d);
+    if (date.getMonth() !== month) break;
+    if (date.getDay() === dow) {
+      count++;
+      if (count === n) return date;
+    }
   }
-  return Math.max(count, 1);
+  return new Date(year, month, 1); // fallback
 };
-const checkThursdayPassed = (): boolean => {
-  const day = new Date().getDay();
-  return day === 5 || day === 6 || day === 0;
+
+// 오늘 이후 가장 가까운 위클리 만기 2개를 날짜순으로 반환
+// 위클리 만기: 매주 월요일(dow=1) + 목요일(dow=4)
+const getNextWeeklyExpiries = (): {
+  tabs: { day: WeekDay; label: string }[];
+  defaultDay: WeekDay;
+} => {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const y = today.getFullYear();
+  const m = today.getMonth();
+
+  const candidates: { date: Date; label: string; day: WeekDay }[] = [];
+
+  // 이번 달 + 다음 달까지 탐색
+  for (let mo = 0; mo <= 1; mo++) {
+    const cm = m + mo;
+    const cy = cm > 11 ? y + 1 : y;
+    const rm = cm % 12;
+
+    for (const dow of [1, 4]) {
+      let weekN = 0;
+      for (let d = 1; d <= 31; d++) {
+        const date = new Date(cy, rm, d);
+        if (date.getMonth() !== rm) break;
+        if (date.getDay() === dow) {
+          weekN++;
+          if (date >= today) {
+            candidates.push({
+              date,
+              label: `${weekN}주 ${dow === 1 ? '월요일' : '목요일'}`,
+              day: (dow === 1 ? '월' : '목') as WeekDay,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  candidates.sort((a, b) => a.date.getTime() - b.date.getTime());
+  const next2 = candidates.slice(0, 2);
+  const tabs = next2.map(c => ({ day: c.day, label: c.label }));
+  return { tabs, defaultDay: tabs[0]?.day ?? '월' };
 };
+
 const generateKP200Months = (): MonthItem[] => {
   const today = new Date();
   let y = today.getFullYear();
@@ -100,9 +147,7 @@ const generateFuturesSearchItems = (): SearchItem[] =>
 const FuturesSearchScreen = () => {
   const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
 
-  const thuWeekNum     = useMemo(() => getWeekNumberByDay(4), []);
-  const monWeekNum     = useMemo(() => getWeekNumberByDay(1), []);
-  const thursdayPassed = useMemo(() => checkThursdayPassed(), []);
+  const { tabs: weeklyTabs, defaultDay } = useMemo(() => getNextWeeklyExpiries(), []);
 
   const kp200ScrollRef  = useRef<ScrollView>(null) as React.MutableRefObject<ScrollView>;
   const weeklyScrollRef = useRef<ScrollView>(null) as React.MutableRefObject<ScrollView>;
@@ -115,7 +160,7 @@ const FuturesSearchScreen = () => {
   const [kp200Months,     setKp200Months]     = useState<MonthItem[]>([]);
   const [expiryMonths,    setExpiryMonths]    = useState<string[]>([]);
   const [selectedExpiry,  setSelectedExpiry]  = useState<string>('');
-  const [weekDay,         setWeekDay]         = useState<WeekDay>(thursdayPassed ? '월' : '목');
+  const [weekDay,         setWeekDay]         = useState<WeekDay>(defaultDay);
   const [dropdownVisible, setDropdownVisible] = useState(false);
   const [kp200Rows,       setKp200Rows]       = useState<OptionRow[]>([]);
   const [kp200Loading,    setKp200Loading]    = useState(false);
@@ -289,37 +334,71 @@ const FuturesSearchScreen = () => {
     await fetchKP200Options(expiries[0]);
   }, [fetchKP200Options]);
 
-  const fetchWeekly = useCallback(async () => {
-    setLoading(true);
-    try {
-      const board = await getOptionBoard('W1 ', 'W');
-      setGmprice(board.summary.gmprice);
-      setAllCalls(board.calls);
-      setAllPuts(board.puts);
-      buildWeeklyRows(board.calls, board.puts, board.summary.gmprice, weekDay);
-    } catch (e: any) {
-      console.log('❌ 위클리 조회 실패:', e?.message);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  // 위클리 캐시 (탭 전환 시 재호출 방지)
+  const weeklyCacheRef = useRef<Partial<Record<WeekDay, {
+    calls: any[]; puts: any[]; gmprice: number; ts: number;
+  }>>>({});
+  const CACHE_TTL_MS = 60_000; // 1분간 캐시 유지
 
-  const buildWeeklyRows = useCallback((calls: any[], puts: any[], gmp: number, day: WeekDay) => {
-    const fC = calls.filter(c => ((c as any).hname ?? '').includes(day));
-    const fP = puts.filter(p  => ((p as any).hname ?? '').includes(day));
+  const buildWeeklyRows = useCallback((calls: any[], puts: any[], gmp: number) => {
     const map = new Map<number, {call?: any; put?: any}>();
-    (fC.length > 0 ? fC : calls).forEach(c => map.set(c.actprice, {...(map.get(c.actprice) ?? {}), call: c}));
-    (fP.length > 0 ? fP : puts).forEach(p  => map.set(p.actprice, {...(map.get(p.actprice) ?? {}), put:  p}));
+    calls.forEach(c => map.set(c.actprice, {...(map.get(c.actprice) ?? {}), call: c}));
+    puts.forEach(p  => map.set(p.actprice, {...(map.get(p.actprice) ?? {}), put:  p}));
     const newRows = buildRowsFromMap(map, gmp);
     setRows(newRows);
     scrollToATM(newRows, weeklyScrollRef);
   }, [buildRowsFromMap, scrollToATM]);
 
+  const fetchWeekly = useCallback(async (day: WeekDay, retry = 0) => {
+    // 캐시 확인
+    const cached = weeklyCacheRef.current[day];
+    if (cached && Date.now() - cached.ts < CACHE_TTL_MS) {
+      setGmprice(cached.gmprice);
+      setAllCalls(cached.calls);
+      setAllPuts(cached.puts);
+      buildWeeklyRows(cached.calls, cached.puts, cached.gmprice);
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const board = await getWeeklyOptionBoard(day);
+      // 캐시 저장
+
+          console.log(`[위클리 ${day}] yyyymm: ${day === '월' ? 'W1 ' : 'W2 '}`);
+    console.log(`[위클리 ${day}] 콜 첫 번째 optcode:`, board.calls[0]?.optcode);
+    console.log(`[위클리 ${day}] 풋 첫 번째 optcode:`, board.puts[0]?.optcode);
+    console.log(`[위클리 ${day}] 잔존일:`, board.summary.jandatecnt);
+      weeklyCacheRef.current[day] = {
+        calls: board.calls, puts: board.puts,
+        gmprice: board.summary.gmprice, ts: Date.now(),
+      };
+      setGmprice(board.summary.gmprice);
+      setAllCalls(board.calls);
+      setAllPuts(board.puts);
+      buildWeeklyRows(board.calls, board.puts, board.summary.gmprice);
+    } catch (e: any) {
+      const msg: string = e?.message ?? '';
+      // 거래건수 초과 → 최대 3회 재시도 (1s, 2s, 3s 딜레이)
+      if (msg.includes('초과') && retry < 3) {
+        const delay = (retry + 1) * 1000;
+        console.log(`⚠️ 위클리(${day}) 거래건수 초과 — ${delay/1000}초 후 재시도 (${retry + 1}/3)`);
+        setTimeout(() => fetchWeekly(day, retry + 1), delay);
+      } else {
+        console.log(`❌ 위클리(${day}) 조회 실패:`, msg);
+        setLoading(false);
+      }
+      return;
+    } finally {
+      setLoading(false);
+    }
+  }, [buildWeeklyRows]);
+
   useEffect(() => {
     const init = async () => {
       await fetchKP200Months();
-      await new Promise<void>(resolve => setTimeout(resolve, 400));
-      await fetchWeekly();
+      await new Promise<void>(resolve => setTimeout(resolve, 800));
+      await fetchWeekly(defaultDay);
     };
     init();
   }, []);
@@ -330,23 +409,28 @@ const FuturesSearchScreen = () => {
   }, [selectedExpiry]);
 
   useEffect(() => {
-    if (allCalls.length > 0 || allPuts.length > 0) buildWeeklyRows(allCalls, allPuts, gmprice, weekDay);
-  }, [weekDay, allCalls, allPuts, gmprice, buildWeeklyRows]);
+    if (allCalls.length > 0 || allPuts.length > 0) buildWeeklyRows(allCalls, allPuts, gmprice);
+  }, [allCalls, allPuts, gmprice, buildWeeklyRows]);
+
+  // weekDay 바뀌면 해당 만기 위클리 조회 (700ms 딜레이로 연속 호출 방지)
+  useEffect(() => {
+    if (productTab !== '위클리') return;
+    const timer = setTimeout(() => fetchWeekly(weekDay), 700);
+    return () => clearTimeout(timer);
+  }, [weekDay]);
 
   const handleWeeklySelect = useCallback((optcode: string, strike: number, type: 'C' | 'P') => {
     if (!optcode) return;
-    const label = weekDay === '목' ? `${thuWeekNum}주 목요일` : `${monWeekNum}주 월요일`;
+    const label  = weeklyTabs.find(t => t.day === weekDay)?.label ?? weekDay;
+    const yyyymm = weekDay === '월' ? 'W1 ' : 'W2 ';
     navigation.navigate('FuturesOption', {
       shcode: optcode,
       hname:  `${type === 'C' ? 'C' : 'P'} ${label} ${fmt2(strike)}`,
-      yyyymm: 'W1 ',
+      yyyymm: yyyymm,
     });
-  }, [navigation, weekDay, thuWeekNum, monWeekNum]);
+  }, [navigation, weekDay, weeklyTabs]);
 
-  const weekDayTabs: {day: WeekDay; label: string}[] = [
-    ...(!thursdayPassed ? [{day: '목' as WeekDay, label: `${thuWeekNum}주 목요일`}] : []),
-    {day: '월' as WeekDay, label: `${monWeekNum}주 월요일`},
-  ];
+  const weekDayTabs = weeklyTabs;
 
   const ColHeader = () => (
     <View style={s.colHeader}>

@@ -1,16 +1,17 @@
 import React, {useState, useEffect, useRef} from 'react';
 import {
-  View, Text, StyleSheet, ScrollView, FlatList, Modal,
+  View, Text, StyleSheet, ScrollView, FlatList, Modal, TextInput,
   TouchableOpacity, StatusBar, Alert, ActivityIndicator,
 } from 'react-native';
 import {SafeAreaView} from 'react-native-safe-area-context';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import {useNavigation, useRoute, RouteProp} from '@react-navigation/native';
 import {NativeStackNavigationProp} from '@react-navigation/native-stack';
 import {RootStackParamList} from '../navigation/RootNavigator';
 import {
   placeOrder, modifyOrder, cancelOrder, getPendingOrders, getFuturesOrders,
-  getFuturesHoga, getFuturesHoldings,
-  FuturesHolding, FuturesHoldingSummary, FuturesOrderItem,
+  getFuturesHoga, getFuturesPrice, getFuturesBalance,
+  FuturesOrderItem, FuturesBalanceHolding, FuturesBalanceSummary,
   OrderPriceType,
 } from '../api/lsApi';
 
@@ -41,7 +42,24 @@ const C = {
   green:    '#00897B',
 };
 
-type OrderMode = '매수' | '매도' | '정정/취소' | '체결' | '잔고';
+type OrderMode = '매수' | '매도' | '정정/취소' | '체결' | '잔고' | '자동화';
+type AutoSubTab = '추가' | '조회/수정';
+
+// ── 자동화 상태 타입 ────────────────────────────────────────────────────────
+type AutoStatus = 'idle' | 'monitoring' | 'ordered' | 'done' | 'error';
+interface AutoConfig {
+  putOptCode:    string;  // 풋옵션 종목코드 (t2105 조회용)
+  putStrike:     number;  // 풋옵션 행사가 (코스피200)
+  putSellPrice:  number;  // 풋옵션 매도가 (참고용)
+  putQty:        number;  // 풋옵션 수량 (참고용)
+  futuresCode:   string;  // 선물 종목코드 (주문용)
+  futuresQty:    number;  // 선물 매수 수량
+  exitThreshold: number;  // 옵션 청산 기준가
+  exitEnabled:   boolean; // 청산 예약 활성화
+  futuresBuyEnabled: boolean; // 선물 매수 자동화 활성화
+  monitorStart:  string;  // HH:MM:SS
+  orderDeadline: string;  // HH:MM:SS
+}
 
 const CandleIcon = ({color, size = 28}: {color: string; size?: number}) => {
   const w = size * 0.35;
@@ -145,8 +163,8 @@ const OrderScreen = () => {
   const [liveBids,            setLiveBids]            = useState(hoga?.bids ?? []);
   const [liveDvol,            setLiveDvol]            = useState(hoga?.dvol ?? 0);
   const [liveSvol,            setLiveSvol]            = useState(hoga?.svol ?? 0);
-  const [holdings,            setHoldings]            = useState<FuturesHolding[]>([]);
-  const [holdingSummary,      setHoldingSummary]      = useState<FuturesHoldingSummary | null>(null);
+  const [holdings,            setHoldings]            = useState<FuturesBalanceHolding[]>([]);
+  const [holdingSummary,      setHoldingSummary]      = useState<FuturesBalanceSummary | null>(null);
   const [holdingLoading,      setHoldingLoading]      = useState(false);
   const [pendingOrders,       setPendingOrders]       = useState<FuturesOrderItem[]>([]);
   const [pendingLoading,      setPendingLoading]      = useState(false);
@@ -160,6 +178,194 @@ const OrderScreen = () => {
   const [orderHistory,        setOrderHistory]        = useState<FuturesOrderItem[]>([]);
   const [historyFilter,       setHistoryFilter]       = useState<'0'|'1'|'2'>('0');
   const [historyLoading,      setHistoryLoading]      = useState(false);
+
+  // ── 자동화 탭 상태 ─────────────────────────────────────────────────────────
+  // shcode가 'F'로 시작하면 선물 종목 → 조회/수정만 / 그 외(O,C 등) → 풋옵션 → 추가 + 조회/수정
+  // hname이 'P ' 또는 'C '로 시작하면 옵션 종목, 아니면 선물
+  // 예) "P 2주 월요일 882.50" → 옵션, "F 2606" → 선물, "A0166000" → 선물
+  const hname = route.params.hname ?? '';
+  const isOptionCode = /^[PC]\s/i.test(hname);
+  const isFuturesCode = !isOptionCode;
+  const autoIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [autoSubTab,        setAutoSubTab]        = useState<AutoSubTab>(isFuturesCode ? '조회/수정' : '추가');
+  const [autoStatus,        setAutoStatus]        = useState<AutoStatus>('idle');
+  const [autoLog,           setAutoLog]           = useState<string[]>([]);
+  const [autoKospi,         setAutoKospi]         = useState<number | null>(null);
+  const [autoOptPrice,      setAutoOptPrice]      = useState<number | null>(null);
+  const [autoFutPrice,      setAutoFutPrice]      = useState<number | null>(null);
+  const [allSavedConfigs,   setAllSavedConfigs]   = useState<Record<string, AutoConfig>>({});
+  const [autoConfig,    setAutoConfig]    = useState<AutoConfig>({
+    // 풋옵션 종목코드 — 현재 진입한 종목이 옵션이면 그 코드를 자동 세팅
+    putOptCode:        isFuturesCode ? '' : (shcode ?? ''),
+    // hname 끝 숫자가 행사가 (예: "P 2주 월요일 912.50" → 912.5)
+    // 파싱 실패 시 initPrice 폴백
+    putStrike: (() => {
+      const hn = route.params.hname ?? '';
+      const match = hn.match(/([\d.]+)\s*$/);
+      return match ? Number(match[1]) : initPrice;
+    })(),
+    putSellPrice:      1.50,
+    putQty:            1,
+    // 선물 종목코드 — 선물 종목에서 진입하면 현재 shcode, 아니면 빈값
+    futuresCode:       isFuturesCode ? (shcode ?? '') : '',
+    futuresQty:        1,
+    exitThreshold:     0.20,
+    exitEnabled:       true,
+    futuresBuyEnabled: false,
+    monitorStart:      '15:32:00',
+    orderDeadline:     '15:35:00',
+  });
+
+  const addLog = (msg: string) => {
+    const now = new Date();
+    const ts  = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}:${String(now.getSeconds()).padStart(2,'0')}`;
+    setAutoLog(prev => [`[${ts}] ${msg}`, ...prev].slice(0, 100));
+  };
+
+  // ── 자동화 설정 저장/불러오기 (AsyncStorage) ──────────────────────────────
+  // 고정 키에 {[putOptCode]: AutoConfig} 맵으로 저장
+  const STORAGE_KEY = 'autoConfigs';
+  const isConfigLoaded = useRef(false);
+
+  // 진입 시 저장된 자동화 전체 목록 불러오기
+  useEffect(() => {
+    AsyncStorage.getItem(STORAGE_KEY).then(val => {
+      if (val) {
+        try {
+          const all: Record<string, AutoConfig> = JSON.parse(val);
+          setAllSavedConfigs(all);
+          // 옵션 종목이면 해당 종목 설정도 autoConfig에 세팅
+          if (!isFuturesCode && shcode) {
+            const saved = all[shcode];
+            if (saved) {
+              setAutoConfig(prev => ({...prev, ...saved}));
+              console.log('✅ 자동화 설정 불러옴:', shcode);
+            }
+          }
+        } catch {}
+      }
+      isConfigLoaded.current = true;
+    }).catch(() => { isConfigLoaded.current = true; });
+  }, []);
+
+  const stopAutoMonitor = () => {
+    if (autoIntervalRef.current) { clearInterval(autoIntervalRef.current); autoIntervalRef.current = null; }
+    setAutoStatus(prev => prev === 'monitoring' ? 'idle' : prev);
+  };
+
+  // 자동화 탭에서 탭 이탈 시 인터벌 정리
+  useEffect(() => {
+    if (tab !== '자동화') stopAutoMonitor();
+  }, [tab]);
+
+  // 현재 시각 HH:MM:SS 문자열 반환
+  const nowHHMMSS = () => {
+    const n = new Date();
+    return `${String(n.getHours()).padStart(2,'0')}:${String(n.getMinutes()).padStart(2,'0')}:${String(n.getSeconds()).padStart(2,'0')}`;
+  };
+
+  // 자동화 설정 명시적 저장 (등록 버튼 누를 때 호출)
+  const saveAutoConfig = async (cfg: AutoConfig) => {
+    const saveKey = cfg.putOptCode || (shcode ?? '');
+    if (!saveKey) return;
+    try {
+      const val = await AsyncStorage.getItem(STORAGE_KEY);
+      const all: Record<string, AutoConfig> = val ? JSON.parse(val) : {};
+      all[saveKey] = cfg;
+      await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(all));
+      setAllSavedConfigs({...all});
+      console.log('💾 자동화 저장 완료:', saveKey);
+    } catch (e) {
+      console.log('❌ 자동화 저장 실패:', e);
+    }
+  };
+
+  const startAutoMonitor = () => {
+    if (autoStatus === 'monitoring') return;
+    if (!autoConfig.putOptCode.trim()) {
+      Alert.alert('설정 오류', '풋옵션 종목코드를 입력해주세요.\n예) CAFB8760');
+      return;
+    }
+    if (autoConfig.futuresBuyEnabled && !autoConfig.futuresCode.trim()) {
+      Alert.alert('설정 오류', '선물 자동 매수를 사용하려면\n선물 종목코드를 입력해주세요.');
+      return;
+    }
+    setAutoLog([]);
+    setAutoStatus('monitoring');
+    setAutoKospi(null);
+    setAutoOptPrice(null);
+    setAutoFutPrice(null);
+    addLog('자동화 모니터링 시작');
+    addLog(`풋옵션 코드: ${autoConfig.putOptCode} / 행사가: ${autoConfig.putStrike}`);
+    if (autoConfig.futuresBuyEnabled) addLog(`선물 자동 매수: ${autoConfig.futuresCode}`);
+    if (autoConfig.exitEnabled)       addLog(`청산 예약: ${autoConfig.exitThreshold.toFixed(2)} 이하`);
+
+    autoIntervalRef.current = setInterval(async () => {
+      const now = nowHHMMSS();
+
+      if (now >= autoConfig.orderDeadline) {
+        addLog(`⏰ 주문 마감 시각 ${autoConfig.orderDeadline} 도달 — 모니터링 종료`);
+        if (autoIntervalRef.current) { clearInterval(autoIntervalRef.current); autoIntervalRef.current = null; }
+        setAutoStatus('done');
+        return;
+      }
+
+      if (now < autoConfig.monitorStart) {
+        addLog(`⏳ ${autoConfig.monitorStart} 이후 활성화 (현재 ${now})`);
+        return;
+      }
+
+      try {
+        // ① 선물 현재가 + 코스피200 현물지수 (t2101)
+        const futCode   = autoConfig.futuresCode || (shcode ?? 'A0166000');
+        const priceData = await getFuturesPrice(futCode);
+        const kospi200  = priceData.kospijisu;
+        const futPrice  = priceData.price;
+        setAutoKospi(kospi200);
+        setAutoFutPrice(futPrice);
+
+        // ② 풋옵션 현재가 (t2105)
+        const optHoga  = await getFuturesHoga(autoConfig.putOptCode);
+        const optPrice = optHoga.price;
+        setAutoOptPrice(optPrice);
+
+        addLog(`코스피200: ${kospi200.toFixed(2)} | 풋옵션: ${optPrice.toFixed(2)}P | 선물: ${futPrice.toFixed(2)}`);
+
+        // ③ 청산 예약: 옵션가 <= 기준가
+        if (autoConfig.exitEnabled && optPrice <= autoConfig.exitThreshold) {
+          addLog(`⚠️ 청산 조건 충족! 풋옵션가 ${optPrice.toFixed(2)} ≤ ${autoConfig.exitThreshold.toFixed(2)}`);
+          addLog('→ 수동 청산 필요 (자동 청산 기능 추후 추가)');
+        }
+
+        // ④ 선물 자동 매수: 코스피200 현물 < 행사가
+        if (autoConfig.futuresBuyEnabled && kospi200 < autoConfig.putStrike) {
+          addLog(`⚠️ 선물 매수 조건 충족! 코스피 ${kospi200.toFixed(2)} < 행사가 ${autoConfig.putStrike}`);
+          addLog(`선물 매수 주문 — ${autoConfig.futuresCode} ${autoConfig.futuresQty}계약 @ ${(futPrice + 0.5).toFixed(2)}`);
+
+          if (autoIntervalRef.current) { clearInterval(autoIntervalRef.current); autoIntervalRef.current = null; }
+          setAutoStatus('ordered');
+
+          try {
+            const res = await placeOrder({
+              fnoIsuNo:  autoConfig.futuresCode,
+              bnsTpCode: '2',
+              orderType: '00',
+              price:     +(futPrice + 0.5).toFixed(2),
+              qty:       autoConfig.futuresQty,
+            });
+            const b2 = res.CFOAT00100OutBlock2;
+            addLog(`✅ 선물 매수 완료 — 주문번호: ${b2?.OrdNo ?? '-'} / ${b2?.IsuNm ?? '-'}`);
+            setAutoStatus('done');
+          } catch (e: any) {
+            addLog(`❌ 선물 매수 실패: ${e?.message ?? '알 수 없는 오류'}`);
+            setAutoStatus('error');
+          }
+        }
+      } catch (e: any) {
+        addLog(`❌ API 조회 실패: ${e?.message}`);
+      }
+    }, 10000);
+  };
 
   // ── 호가 갱신 ──────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -179,7 +385,7 @@ const OrderScreen = () => {
   useEffect(() => {
     if (tab !== '잔고') return;
     setHoldingLoading(true);
-    getFuturesHoldings()
+    getFuturesBalance()
       .then(({summary, holdings: h}) => { setHoldingSummary(summary); setHoldings(h); })
       .catch(e => console.log('❌ 잔고 조회 실패:', e?.message))
       .finally(() => setHoldingLoading(false));
@@ -365,7 +571,8 @@ const OrderScreen = () => {
   const priceColor  = getSignColor(sign ?? '3');
   const asks = liveAsks.length > 0 ? liveAsks : [5,4,3,2,1].map(i => ({price: +(initPrice + i * 0.05).toFixed(2), qty: 0}));
   const bids = liveBids.length > 0 ? liveBids : [1,2,3,4,5].map(i => ({price: +(initPrice - i * 0.05).toFixed(2), qty: 0}));
-  const ORDER_TABS: OrderMode[] = ['매수', '매도', '정정/취소', '체결', '잔고'];
+  // 선물 종목(F로 시작)이면 자동화 탭 하나만, 풋옵션이면 자동화 탭 하나(내부 서브탭으로 분기)
+  const ORDER_TABS: OrderMode[] = ['매수', '매도', '자동화', '정정/취소', '체결', '잔고'];
 
   const getStatusColor = (status: string) => {
     if (status === '완료') return C.green;
@@ -428,11 +635,13 @@ const OrderScreen = () => {
       <View style={s.tabRow}>
         {ORDER_TABS.map(t => {
           const isActive = tab === t;
-          const bg = isActive ? accentColor : 'transparent';
+          const bg = isActive
+            ? t === '자동화' ? C.green : accentColor
+            : 'transparent';
           return (
             <TouchableOpacity key={t} onPress={() => setTab(t)} activeOpacity={0.8}
-              style={[s.tabBtn, {backgroundColor: bg}]}>
-              <Text style={[s.tabText, isActive && s.tabTextActive]}>{t}</Text>
+              style={[s.tabBtn, {backgroundColor: bg, minWidth: t === '정정/취소' || t === '자동화' ? 54 : undefined}]}>
+              <Text style={[s.tabText, isActive && s.tabTextActive, t === '자동화' && !isActive && {color: C.green, fontWeight:'700'}]}>{t}</Text>
             </TouchableOpacity>
           );
         })}
@@ -451,50 +660,64 @@ const OrderScreen = () => {
               </View>
             ) : (
               <>
+                {/* 상단 평가손익 */}
                 <View style={{flexDirection:'row', alignItems:'center', gap:8, marginBottom:12}}>
                   <View style={s.holdingsBadge}><Text style={{fontSize:11}}>평가손익 ⋮</Text></View>
-                  <Text style={{color:(holdingSummary?.tsunik ?? 0) >= 0 ? C.red : C.blue, fontWeight:'800', fontSize:15, flex:1}}>
-                    {holdingSummary?.tsunik?.toLocaleString() ?? '-'}
+                  <Text style={{
+                    color: (holdingSummary?.futsEvalPnlAmt ?? 0) + (holdingSummary?.optEvalPnlAmt ?? 0) >= 0 ? C.red : C.blue,
+                    fontWeight:'800', fontSize:15, flex:1,
+                  }}>
+                    {holdingSummary
+                      ? ((holdingSummary.futsEvalPnlAmt + holdingSummary.optEvalPnlAmt).toLocaleString())
+                      : '-'}
                   </Text>
                   <TouchableOpacity style={s.holdingsBadge}><Text style={{fontSize:11}}>일괄청산</Text></TouchableOpacity>
-                  <TouchableOpacity style={s.holdingsBadge}><Text style={{fontSize:11}}>이평 ⋮</Text></TouchableOpacity>
                 </View>
+
+                {/* 헤더 */}
                 <View style={s.holdingsHead}>
-                  {['종목번호\n구분','평균단가\n잔고','매입금액\n평가금액','수익율\n평가손익'].map((h,i) => (
+                  {['종목명\n구분','평균단가\n잔고','평가금액\n평가손익','손익율'].map((h,i) => (
                     <Text key={i} style={[s.holdingsHeadText, i > 0 && {textAlign:'right'}]}>{h}</Text>
                   ))}
                 </View>
+
                 {holdings.length === 0
                   ? <View style={{alignItems:'center', marginTop:30}}><Text style={{color:C.dimText, fontSize:13}}>보유 포지션이 없습니다</Text></View>
                   : holdings.map((h, i) => {
-                    const pnlColor = h.dtsunik1 >= 0 ? C.red : C.blue;
+                    const pnlColor = h.evalPnl >= 0 ? C.red : C.blue;
                     return (
                       <View key={i} style={s.holdingsRow}>
-                        <View style={{flex:1.2}}>
-                          <Text style={{fontSize:12, fontWeight:'600'}}>{h.expcode}</Text>
-                          <Text style={{color: h.medocd === '2' ? C.red : C.blue, fontSize:11, marginTop:2}}>{h.medosu}</Text>
+                        {/* 종목명 / 매매구분 */}
+                        <View style={{flex:1.4}}>
+                          <Text style={{fontSize:12, fontWeight:'600'}}>{h.isuNm}</Text>
+                          <Text style={{color: h.bnsTpCode === '2' ? C.red : C.blue, fontSize:11, marginTop:2}}>{h.bnsTpNm}</Text>
                         </View>
+                        {/* 평균단가 / 잔고 */}
                         <View style={{flex:1, alignItems:'flex-end'}}>
-                          <Text style={s.holdingsVal}>{Number(h.pamt).toFixed(2)}</Text>
-                          <Text style={s.holdingsVal}>{h.jqty}</Text>
+                          <Text style={s.holdingsVal}>{h.fnoAvrPrc.toFixed(2)}</Text>
+                          <Text style={s.holdingsVal}>{h.unsttQty}</Text>
                         </View>
+                        {/* 평가금액 / 평가손익 */}
                         <View style={{flex:1.2, alignItems:'flex-end'}}>
-                          <Text style={s.holdingsVal}>{h.mamt.toLocaleString()}</Text>
-                          <Text style={s.holdingsVal}>{h.appamt.toLocaleString()}</Text>
+                          <Text style={s.holdingsVal}>{h.evalAmt.toLocaleString()}</Text>
+                          <Text style={[s.holdingsVal, {color:pnlColor}]}>{h.evalPnl.toLocaleString()}</Text>
                         </View>
-                        <View style={{flex:1, alignItems:'flex-end'}}>
-                          <Text style={[s.holdingsVal, {color:pnlColor}]}>{h.sunikrt}%</Text>
-                          <Text style={[s.holdingsVal, {color:pnlColor}]}>{h.dtsunik1.toLocaleString()}</Text>
+                        {/* 손익율 */}
+                        <View style={{flex:0.7, alignItems:'flex-end'}}>
+                          <Text style={[s.holdingsVal, {color:pnlColor}]}>{h.pnlRat.toFixed(2)}%</Text>
                         </View>
                       </View>
                     );
                   })}
+
+                {/* 하단 요약 */}
                 {holdingSummary && (
                   <View style={{marginTop:12, borderTopWidth:1, borderTopColor:C.border, paddingTop:10, gap:6}}>
                     {[
-                      ['평가금액 합계', holdingSummary.tappamt.toLocaleString() + '원', '#333'],
-                      ['평가손익 합계', holdingSummary.tsunik.toLocaleString() + '원',   holdingSummary.tsunik   >= 0 ? C.red : C.blue],
-                      ['매매손익 합계', holdingSummary.tdtsunik.toLocaleString() + '원', holdingSummary.tdtsunik >= 0 ? C.red : C.blue],
+                      ['선물평가손익', holdingSummary.futsEvalPnlAmt.toLocaleString() + '원', holdingSummary.futsEvalPnlAmt >= 0 ? C.red : C.blue],
+                      ['옵션평가손익', holdingSummary.optEvalPnlAmt.toLocaleString()  + '원', holdingSummary.optEvalPnlAmt  >= 0 ? C.red : C.blue],
+                      ['총손익',       holdingSummary.totPnlAmt.toLocaleString()       + '원', holdingSummary.totPnlAmt       >= 0 ? C.red : C.blue],
+                      ['주문가능금액', holdingSummary.mnyOrdAbleAmt.toLocaleString()   + '원', '#333'],
                     ].map(([label, value, color]) => (
                       <View key={label as string} style={{flexDirection:'row', justifyContent:'space-between'}}>
                         <Text style={{fontSize:12, color:C.subText}}>{label}</Text>
@@ -742,6 +965,419 @@ const OrderScreen = () => {
           </View>
         )}
 
+        {/* ── 자동화 ── */}
+        {tab === '자동화' && (
+          <View style={{flex:1}}>
+
+            {/* ── 서브탭: 선물이면 조회/수정만 / 옵션이면 추가 + 조회/수정 ── */}
+            <View style={as.subTabRow}>
+              {!isFuturesCode && (
+                <TouchableOpacity
+                  onPress={() => setAutoSubTab('추가')}
+                  style={[as.subTabBtn, autoSubTab === '추가' && as.subTabBtnActive]}>
+                  <Text style={[as.subTabText, autoSubTab === '추가' && as.subTabTextActive]}>추가</Text>
+                </TouchableOpacity>
+              )}
+              <TouchableOpacity
+                onPress={() => setAutoSubTab('조회/수정')}
+                style={[as.subTabBtn, autoSubTab === '조회/수정' && as.subTabBtnActive]}>
+                <Text style={[as.subTabText, autoSubTab === '조회/수정' && as.subTabTextActive]}>조회/수정</Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* ══════════════════════════════════════════════
+                서브탭: 추가 (풋옵션 종목에서만)
+            ══════════════════════════════════════════════ */}
+            {autoSubTab === '추가' && !isFuturesCode && (
+              <ScrollView style={{flex:1}} contentContainerStyle={{padding:12, gap:12}}>
+
+                {/* ══ 섹션 1: 풋옵션 매도 설정 ══ */}
+                <View style={as.tlSection}>
+                  <View style={as.tlHeader}>
+                    <View style={as.tlDot}/>
+                    <Text style={as.tlTitle}>풋옵션 매도 설정</Text>
+                    <Text style={as.tlDesc}>장중 직접 주문 후 아래 값을 일치시켜 주세요</Text>
+                  </View>
+
+                  {/* 풋옵션 종목코드 */}
+                  <View style={as.tlRow}>
+                    <Text style={as.tlLabel}>종목코드</Text>
+                    <View style={as.summaryCodeBox}>
+                      <Text style={as.summaryCode}>{autoConfig.putOptCode || (shcode ?? '-')}</Text>
+                    </View>
+                    <Text style={as.tlMeta}>현재 종목 자동 입력</Text>
+                  </View>
+
+                  {/* 행사가 */}
+                  <View style={as.tlRow}>
+                    <Text style={as.tlLabel}>행사가</Text>
+                    <View style={[s.stepper, {flex:1}]}>
+                      <TouchableOpacity onPress={() => setAutoConfig(c => ({...c, putStrike: +(c.putStrike - 2.5).toFixed(2)}))} style={s.stepBtn} disabled={autoStatus === 'monitoring'}>
+                        <Text style={s.stepBtnText}>−</Text>
+                      </TouchableOpacity>
+                      <Text style={[s.stepVal, {color:C.red}]}>{autoConfig.putStrike.toFixed(2)}</Text>
+                      <TouchableOpacity onPress={() => setAutoConfig(c => ({...c, putStrike: +(c.putStrike + 2.5).toFixed(2)}))} style={s.stepBtn} disabled={autoStatus === 'monitoring'}>
+                        <Text style={s.stepBtnText}>+</Text>
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+
+                  {/* 매도가 */}
+                  <View style={as.tlRow}>
+                    <Text style={as.tlLabel}>매도가</Text>
+                    <View style={[s.stepper, {flex:1}]}>
+                      <TouchableOpacity onPress={() => setAutoConfig(c => ({...c, putSellPrice: +(c.putSellPrice - 0.05).toFixed(2)}))} style={s.stepBtn} disabled={autoStatus === 'monitoring'}>
+                        <Text style={s.stepBtnText}>−</Text>
+                      </TouchableOpacity>
+                      <Text style={[s.stepVal, {color:C.red}]}>{autoConfig.putSellPrice.toFixed(2)} P</Text>
+                      <TouchableOpacity onPress={() => setAutoConfig(c => ({...c, putSellPrice: +(c.putSellPrice + 0.05).toFixed(2)}))} style={s.stepBtn} disabled={autoStatus === 'monitoring'}>
+                        <Text style={s.stepBtnText}>+</Text>
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+
+                  {/* 수량 */}
+                  <View style={as.tlRow}>
+                    <Text style={as.tlLabel}>수량</Text>
+                    <View style={[s.stepper, {flex:1}]}>
+                      <TouchableOpacity onPress={() => setAutoConfig(c => ({...c, putQty: Math.max(1, c.putQty - 1)}))} style={s.stepBtn} disabled={autoStatus === 'monitoring'}>
+                        <Text style={s.stepBtnText}>−</Text>
+                      </TouchableOpacity>
+                      <Text style={s.stepVal}>{autoConfig.putQty} <Text style={s.stepUnit}>계약</Text></Text>
+                      <TouchableOpacity onPress={() => setAutoConfig(c => ({...c, putQty: c.putQty + 1}))} style={s.stepBtn} disabled={autoStatus === 'monitoring'}>
+                        <Text style={s.stepBtnText}>+</Text>
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+                </View>
+
+                {/* ══ 섹션 2: 청산 기준 ══ */}
+                <View style={as.tlSection}>
+                  <View style={as.tlHeader}>
+                    <View style={as.tlDot}/>
+                    <Text style={as.tlTitle}>청산 기준</Text>
+                    <Text style={as.tlDesc}>옵션가 기준 자동 알림 (수동 청산)</Text>
+                  </View>
+
+                  <View style={as.tlRow}>
+                    <TouchableOpacity onPress={() => setAutoConfig(c => ({...c, exitEnabled: !c.exitEnabled}))} style={as.checkbox} disabled={autoStatus === 'monitoring'}>
+                      <View style={[as.checkboxBox, autoConfig.exitEnabled && as.checkboxBoxChecked]}>
+                        {autoConfig.exitEnabled && <Text style={as.checkmark}>✓</Text>}
+                      </View>
+                    </TouchableOpacity>
+                    <Text style={as.checkLabel}>청산 예약</Text>
+                    <View style={[s.stepper, {flex:1, opacity: autoConfig.exitEnabled ? 1 : 0.4}]}>
+                      <TouchableOpacity onPress={() => setAutoConfig(c => ({...c, exitThreshold: +(c.exitThreshold - 0.05).toFixed(2)}))} style={s.stepBtn} disabled={!autoConfig.exitEnabled || autoStatus === 'monitoring'}>
+                        <Text style={s.stepBtnText}>−</Text>
+                      </TouchableOpacity>
+                      <Text style={[s.stepVal, {color:C.blue, fontSize:13}]}>{autoConfig.exitThreshold.toFixed(2)}</Text>
+                      <TouchableOpacity onPress={() => setAutoConfig(c => ({...c, exitThreshold: +(c.exitThreshold + 0.05).toFixed(2)}))} style={s.stepBtn} disabled={!autoConfig.exitEnabled || autoStatus === 'monitoring'}>
+                        <Text style={s.stepBtnText}>+</Text>
+                      </TouchableOpacity>
+                    </View>
+                    <View style={as.currentPriceBox}>
+                      <Text style={as.currentPriceLabel}>현재</Text>
+                      <Text style={as.currentPriceVal}>{autoOptPrice !== null ? autoOptPrice.toFixed(2) : '-'}</Text>
+                    </View>
+                  </View>
+                </View>
+
+                {/* ══ 섹션 3: 선물 자동 매수 ══ */}
+                <View style={as.tlSection}>
+                  <View style={as.tlHeader}>
+                    <View style={as.tlDot}/>
+                    <Text style={as.tlTitle}>선물 자동 매수</Text>
+                    <Text style={as.tlDesc}>코스피200 현물 &lt; 행사가 조건 충족 시 실행</Text>
+                  </View>
+
+                  <View style={[as.tlRow, {alignItems:'flex-start'}]}>
+                    <TouchableOpacity onPress={() => setAutoConfig(c => ({...c, futuresBuyEnabled: !c.futuresBuyEnabled}))} style={[as.checkbox, {marginTop:2}]} disabled={autoStatus === 'monitoring'}>
+                      <View style={[as.checkboxBox, autoConfig.futuresBuyEnabled && as.checkboxBoxChecked]}>
+                        {autoConfig.futuresBuyEnabled && <Text style={as.checkmark}>✓</Text>}
+                      </View>
+                    </TouchableOpacity>
+                    <Text style={[as.checkLabel, {flex:1, flexWrap:'wrap'}]}>현물가격이 풋매도 행사가보다 낮을 경우 선물 매수</Text>
+                  </View>
+
+                  {autoConfig.futuresBuyEnabled && (
+                    <View style={{gap:8, opacity: autoStatus === 'monitoring' ? 0.5 : 1}}>
+                      <View style={as.tlRow}>
+                        <Text style={as.tlLabel}>선물 코드</Text>
+                        <TextInput
+                          style={[as.textInput, {flex:1}]}
+                          value={autoConfig.futuresCode}
+                          onChangeText={v => setAutoConfig(c => ({...c, futuresCode: v.toUpperCase()}))}
+                          placeholder="예) A0166000"
+                          placeholderTextColor={C.dimText}
+                          autoCapitalize="characters"
+                          editable={autoStatus !== 'monitoring'}
+                        />
+                      </View>
+                      <View style={as.tlRow}>
+                        <Text style={as.tlLabel}>매수 수량</Text>
+                        <View style={[s.stepper, {flex:1}]}>
+                          <TouchableOpacity onPress={() => setAutoConfig(c => ({...c, futuresQty: Math.max(1, c.futuresQty - 1)}))} style={s.stepBtn} disabled={autoStatus === 'monitoring'}>
+                            <Text style={s.stepBtnText}>−</Text>
+                          </TouchableOpacity>
+                          <Text style={s.stepVal}>{autoConfig.futuresQty} <Text style={s.stepUnit}>계약</Text></Text>
+                          <TouchableOpacity onPress={() => setAutoConfig(c => ({...c, futuresQty: c.futuresQty + 1}))} style={s.stepBtn} disabled={autoStatus === 'monitoring'}>
+                            <Text style={s.stepBtnText}>+</Text>
+                          </TouchableOpacity>
+                        </View>
+                      </View>
+                      <View style={as.infoBox}>
+                        <Text style={as.infoText}>주문가 = 선물 현재가 (t2101) + 0.5</Text>
+                      </View>
+                    </View>
+                  )}
+                </View>
+
+                {/* ══ 섹션 4: 시간 설정 ══ */}
+                <View style={as.tlSection}>
+                  <View style={as.tlHeader}>
+                    <View style={as.tlDot}/>
+                    <Text style={as.tlTitle}>시간 설정</Text>
+                    <Text style={as.tlDesc}>장 마감시간(15:30) 전후 자동처리 등록</Text>
+                  </View>
+
+                  <View style={as.timeRow}>
+                    <View style={{flex:1}}>
+                      <Text style={[as.tlLabel, {marginBottom:4}]}>모니터링 시작</Text>
+                      <View style={[as.timeBox, {borderColor:C.green}]}>
+                        <Text style={[as.timeVal, {color:C.green}]}>{autoConfig.monitorStart}</Text>
+                      </View>
+                    </View>
+                    <Text style={{fontSize:16, color:C.dimText, marginTop:18, paddingHorizontal:4}}>→</Text>
+                    <View style={{flex:1}}>
+                      <Text style={[as.tlLabel, {marginBottom:4}]}>주문 마감</Text>
+                      <View style={[as.timeBox, {borderColor:C.red}]}>
+                        <Text style={[as.timeVal, {color:C.red}]}>{autoConfig.orderDeadline}</Text>
+                      </View>
+                    </View>
+                  </View>
+                </View>
+
+                {/* ── 상태 배너 ── */}
+                {autoStatus === 'monitoring' && (
+                  <View style={[as.statusBanner, {borderColor:C.green, backgroundColor:'#E8F5E9'}]}>
+                    <View style={{flexDirection:'row', alignItems:'center', gap:8}}>
+                      <ActivityIndicator size="small" color={C.green}/>
+                      <Text style={[as.statusText, {color:C.green}]}>모니터링 중 (10초 간격)</Text>
+                    </View>
+                    {(autoKospi !== null || autoOptPrice !== null) && (
+                      <View style={{flexDirection:'row', gap:20, marginTop:8}}>
+                        {autoKospi !== null && (
+                          <View>
+                            <Text style={as.statusSubLabel}>코스피200</Text>
+                            <Text style={[as.statusSubVal, {color: autoKospi < autoConfig.putStrike ? C.red : C.blue}]}>{autoKospi.toFixed(2)}</Text>
+                          </View>
+                        )}
+                        {autoOptPrice !== null && (
+                          <View>
+                            <Text style={as.statusSubLabel}>풋옵션가</Text>
+                            <Text style={[as.statusSubVal, {color: autoConfig.exitEnabled && autoOptPrice <= autoConfig.exitThreshold ? C.orange : '#333'}]}>{autoOptPrice.toFixed(2)} P</Text>
+                          </View>
+                        )}
+                        {autoFutPrice !== null && (
+                          <View>
+                            <Text style={as.statusSubLabel}>선물가</Text>
+                            <Text style={as.statusSubVal}>{autoFutPrice.toFixed(2)}</Text>
+                          </View>
+                        )}
+                      </View>
+                    )}
+                  </View>
+                )}
+                {autoStatus === 'error' && (
+                  <View style={[as.statusBanner, {borderColor:C.red, backgroundColor:'#FFEBEE'}]}>
+                    <Text style={[as.statusText, {color:C.red}]}>오류 발생 — 조회/수정 탭 로그를 확인하세요</Text>
+                  </View>
+                )}
+                {autoStatus === 'done' && (
+                  <View style={[as.statusBanner, {borderColor:C.blue, backgroundColor:'#E3F2FD'}]}>
+                    <Text style={[as.statusText, {color:C.blue}]}>자동화 종료 완료</Text>
+                  </View>
+                )}
+
+                {/* ── 등록 / 중지 / 초기화 버튼 ── */}
+                {(autoStatus === 'idle' || autoStatus === 'error') && (
+                  <TouchableOpacity
+                    style={[s.mainOrderBtn, {backgroundColor: C.green}]}
+                    onPress={() => {
+                      const lines = [
+                        `풋옵션: ${autoConfig.putOptCode || shcode} / 행사가: ${autoConfig.putStrike}`,
+                        autoConfig.exitEnabled       ? `청산 예약: ${autoConfig.exitThreshold.toFixed(2)}P 이하` : '',
+                        autoConfig.futuresBuyEnabled ? `선물 매수: ${autoConfig.futuresCode} ${autoConfig.futuresQty}계약` : '',
+                        '',
+                        '자동화를 등록하시겠습니까?',
+                      ].filter(Boolean).join('\n');
+                      Alert.alert('자동화 등록 확인', lines, [
+                        {text: '취소', style: 'cancel'},
+                        {text: '등록', onPress: () => { saveAutoConfig(autoConfig); startAutoMonitor(); }},
+                      ]);
+                    }}>
+                    <Text style={s.mainOrderBtnText}>등록</Text>
+                  </TouchableOpacity>
+                )}
+                {autoStatus === 'monitoring' && (
+                  <TouchableOpacity
+                    style={[s.mainOrderBtn, {backgroundColor: C.orange}]}
+                    onPress={() => Alert.alert('모니터링 중지', '자동화를 중지하시겠습니까?', [
+                      {text: '취소', style: 'cancel'},
+                      {text: '중지', style: 'destructive', onPress: () => {
+                        if (autoIntervalRef.current) { clearInterval(autoIntervalRef.current); autoIntervalRef.current = null; }
+                        setAutoStatus('idle');
+                        addLog('사용자가 모니터링을 중지했습니다');
+                      }},
+                    ])}>
+                    <Text style={s.mainOrderBtnText}>중지</Text>
+                  </TouchableOpacity>
+                )}
+                {(autoStatus === 'done' || autoStatus === 'ordered') && (
+                  <TouchableOpacity
+                    style={[s.mainOrderBtn, {backgroundColor: C.subText}]}
+                    onPress={() => { setAutoStatus('idle'); setAutoLog([]); setAutoKospi(null); setAutoOptPrice(null); setAutoFutPrice(null); }}>
+                    <Text style={s.mainOrderBtnText}>초기화</Text>
+                  </TouchableOpacity>
+                )}
+
+              </ScrollView>
+            )}
+
+            {/* ══════════════════════════════════════════════
+                서브탭: 조회
+            ══════════════════════════════════════════════ */}
+            {autoSubTab === '조회/수정' && (
+              <ScrollView style={{flex:1}} contentContainerStyle={{padding:12, gap:10}}>
+
+                {/* 현재 자동화 설정 요약 */}
+                <Text style={as.condTitle}>등록된 자동화</Text>
+
+                {Object.keys(allSavedConfigs).length === 0 ? (
+                  <View style={as.emptyBox}>
+                    <Text style={as.emptyText}>등록된 자동화가 없습니다</Text>
+                    {!isFuturesCode && (
+                      <TouchableOpacity onPress={() => setAutoSubTab('추가')} style={{marginTop:12}}>
+                        <Text style={{color:C.green, fontWeight:'700', fontSize:13}}>+ 자동화 추가하기</Text>
+                      </TouchableOpacity>
+                    )}
+                  </View>
+                ) : (
+                  <>
+                    {/* 저장된 자동화 목록 전체 표시 */}
+                    {Object.entries(allSavedConfigs).map(([optCode, cfg]) => {
+                      const isActive = autoConfig.putOptCode === optCode && autoStatus !== 'idle';
+                      const pnlColor = isActive && autoStatus === 'monitoring' ? C.green : C.subText;
+                      return (
+                        <View key={optCode} style={[as.summaryCard, {marginBottom:8}]}>
+                          <View style={{flexDirection:'row', justifyContent:'space-between', alignItems:'center', marginBottom:8}}>
+                            <Text style={as.summaryName}>{optCode}</Text>
+                            <View style={{flexDirection:'row', gap:6, alignItems:'center'}}>
+                              {/* 삭제 버튼 */}
+                              <TouchableOpacity
+                                onPress={() => Alert.alert('삭제 확인', `${optCode} 자동화를 삭제하시겠습니까?`, [
+                                  {text: '취소', style: 'cancel'},
+                                  {text: '삭제', style: 'destructive', onPress: () => {
+                                    AsyncStorage.getItem(STORAGE_KEY).then(val => {
+                                      const all: Record<string, AutoConfig> = val ? JSON.parse(val) : {};
+                                      delete all[optCode];
+                                      setAllSavedConfigs({...all});
+                                      return AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(all));
+                                    }).catch(() => {});
+                                  }},
+                                ])}
+                                style={{padding:4}}>
+                                <Text style={{fontSize:11, color:C.red}}>삭제</Text>
+                              </TouchableOpacity>
+                              {/* 상태 뱃지 */}
+                              <View style={[as.statusPill, {
+                                backgroundColor: isActive && autoStatus === 'monitoring' ? '#E8F5E9' : '#F5F5F5',
+                              }]}>
+                                {isActive && autoStatus === 'monitoring' && <ActivityIndicator size="small" color={C.green} style={{marginRight:4}}/>}
+                                <Text style={[as.statusPillText, {color: pnlColor}]}>
+                                  {isActive && autoStatus === 'monitoring' ? '모니터링 중' : '대기'}
+                                </Text>
+                              </View>
+                            </View>
+                          </View>
+
+                          {[
+                            ['행사가',   `${cfg.putStrike.toFixed(2)}`],
+                            ['청산 예약', cfg.exitEnabled ? `${cfg.exitThreshold.toFixed(2)} P 이하` : '미사용'],
+                            ['선물 매수', cfg.futuresBuyEnabled ? `${cfg.futuresCode} / ${cfg.futuresQty}계약` : '미사용'],
+                            ['시간',      `${cfg.monitorStart} ~ ${cfg.orderDeadline}`],
+                          ].map(([label, val]) => (
+                            <View key={label} style={as.queryRow}>
+                              <Text style={as.queryLabel}>{label}</Text>
+                              <Text style={as.queryVal}>{val}</Text>
+                            </View>
+                          ))}
+
+                          {/* 이 항목 선택해서 수정/모니터링 */}
+                          {autoStatus !== 'monitoring' && (
+                            <TouchableOpacity
+                              style={[s.mainOrderBtn, {backgroundColor: C.navy, marginTop:8}]}
+                              onPress={() => {
+                                setAutoConfig({...cfg});
+                                setAutoSubTab('추가');
+                              }}>
+                              <Text style={s.mainOrderBtnText}>이 설정으로 수정/등록</Text>
+                            </TouchableOpacity>
+                          )}
+                        </View>
+                      );
+                    })}
+
+                    {/* 실행 로그 */}
+                    {autoLog.length > 0 && (
+                      <View style={as.logBox}>
+                        <View style={{flexDirection:'row', justifyContent:'space-between', marginBottom:6}}>
+                          <Text style={as.logTitle}>실행 로그</Text>
+                          <TouchableOpacity onPress={() => setAutoLog([])}>
+                            <Text style={{fontSize:11, color:C.dimText}}>지우기</Text>
+                          </TouchableOpacity>
+                        </View>
+                        {autoLog.map((line, i) => (
+                          <Text key={i} style={[as.logLine, {
+                            color: line.includes('✅') ? C.green  :
+                                   line.includes('❌') ? C.red    :
+                                   line.includes('⚠️') ? C.orange :
+                                   line.includes('⏰') ? C.navy   : C.subText,
+                          }]}>{line}</Text>
+                        ))}
+                      </View>
+                    )}
+
+                    {/* 중지 버튼 */}
+                    {autoStatus === 'monitoring' && (
+                      <TouchableOpacity
+                        style={[s.mainOrderBtn, {backgroundColor: C.orange}]}
+                        onPress={() => Alert.alert('모니터링 중지', '자동화를 중지하시겠습니까?', [
+                          {text: '취소', style: 'cancel'},
+                          {text: '중지', style: 'destructive', onPress: () => {
+                            if (autoIntervalRef.current) { clearInterval(autoIntervalRef.current); autoIntervalRef.current = null; }
+                            setAutoStatus('idle');
+                            addLog('사용자가 모니터링을 중지했습니다');
+                          }},
+                        ])}>
+                        <Text style={s.mainOrderBtnText}>모니터링 중지</Text>
+                      </TouchableOpacity>
+                    )}
+                    {(autoStatus === 'done' || autoStatus === 'ordered') && (
+                      <TouchableOpacity
+                        style={[s.mainOrderBtn, {backgroundColor: C.subText}]}
+                        onPress={() => { setAutoStatus('idle'); setAutoLog([]); setAutoKospi(null); setAutoOptPrice(null); setAutoFutPrice(null); }}>
+                        <Text style={s.mainOrderBtnText}>초기화</Text>
+                      </TouchableOpacity>
+                    )}
+                  </>
+                )}
+              </ScrollView>
+            )}
+
+          </View>
+        )}
+
         {/* ── 매수/매도 ── */}
         {(tab === '매수' || tab === '매도') && (
           <>
@@ -881,3 +1517,84 @@ const pbs = StyleSheet.create({
 });
 
 export default OrderScreen;
+
+// ── 자동화 탭 스타일 ──────────────────────────────────────────────────────────
+const as = StyleSheet.create({
+  // 서브탭
+  subTabRow:         {flexDirection:'row', borderBottomWidth:1, borderBottomColor:C.border, backgroundColor:'#F8F9FA'},
+  subTabBtn:         {paddingHorizontal:20, paddingVertical:9, borderBottomWidth:2, borderBottomColor:'transparent'},
+  subTabBtnActive:   {borderBottomColor:C.green},
+  subTabText:        {fontSize:13, color:C.subText},
+  subTabTextActive:  {color:C.green, fontWeight:'700'},
+  // 조건 타이틀
+  condTitle:         {fontSize:13, fontWeight:'800', color:'#333', paddingBottom:2},
+  // 요약 카드
+  summaryCard:       {borderWidth:1, borderColor:C.border, borderRadius:10, padding:12, backgroundColor:'#FAFAFA', gap:8},
+  summaryName:       {fontSize:13, fontWeight:'800', color:'#111', marginBottom:2},
+  summaryRow:        {flexDirection:'row', alignItems:'center', gap:8},
+  summaryLabel:      {fontSize:12, color:C.subText, width:72},
+  summaryCodeBox:    {borderWidth:1, borderColor:'#DDD', borderRadius:6, paddingHorizontal:10, paddingVertical:5, backgroundColor:C.bg},
+  summaryCode:       {fontSize:13, fontWeight:'700', color:'#111'},
+  summaryMeta:       {fontSize:11, color:C.dimText},
+  summaryValBox:     {flex:1, borderWidth:1, borderColor:'#DDD', borderRadius:6, paddingHorizontal:10, paddingVertical:5, backgroundColor:C.bg},
+  summaryValText:    {fontSize:12, color:'#333'},
+  // 폼 행 (label + input 가로 배치)
+  formRow:           {flexDirection:'row', alignItems:'center', gap:10},
+  formLabel:         {fontSize:12, color:C.subText, width:52},
+  // 체크박스
+  checkRow:          {flexDirection:'row', alignItems:'center', gap:8},
+  checkbox:          {padding:2},
+  checkboxBox:       {width:20, height:20, borderWidth:1.5, borderColor:'#AAA', borderRadius:4, alignItems:'center', justifyContent:'center'},
+  checkboxBoxChecked:{backgroundColor:C.green, borderColor:C.green},
+  checkmark:         {color:'#FFF', fontSize:12, fontWeight:'700', lineHeight:14},
+  checkLabel:        {fontSize:13, color:'#333'},
+  currentPriceBox:   {borderWidth:1, borderColor:'#DDD', borderRadius:6, paddingHorizontal:8, paddingVertical:5, alignItems:'center', minWidth:60},
+  currentPriceLabel: {fontSize:9, color:C.dimText},
+  currentPriceVal:   {fontSize:12, fontWeight:'700', color:'#333'},
+  // 상태
+  statusBanner:      {borderWidth:1.5, borderRadius:10, padding:12, gap:4},
+  statusText:        {fontSize:13, fontWeight:'700'},
+  statusSubLabel:    {fontSize:10, color:C.subText, marginBottom:1},
+  statusSubVal:      {fontSize:15, fontWeight:'800'},
+  statusPill:        {flexDirection:'row', alignItems:'center', borderRadius:20, paddingHorizontal:10, paddingVertical:4},
+  statusPillText:    {fontSize:11, fontWeight:'700'},
+  // 입력
+  textInput:         {
+    borderWidth:1, borderColor:'#DDD', borderRadius:8,
+    paddingHorizontal:12, paddingVertical:9,
+    fontSize:13, fontWeight:'600', color:'#111',
+    backgroundColor:C.bg,
+  },
+  inputRow:          {gap:3},
+  inputHint:         {fontSize:10, color:C.dimText, paddingLeft:2},
+  // 타임라인 섹션
+  tlSection:         {borderWidth:1, borderColor:C.border, borderRadius:12, padding:12, gap:10, backgroundColor:'#FAFAFA'},
+  tlHeader:          {flexDirection:'row', alignItems:'center', flexWrap:'wrap', gap:6, marginBottom:2},
+  tlDot:             {width:8, height:8, borderRadius:4, backgroundColor:C.green},
+  tlTitle:           {fontSize:13, fontWeight:'800', color:'#111'},
+  tlDesc:            {fontSize:11, color:C.subText, width:'100%', paddingLeft:14},
+  tlRow:             {flexDirection:'row', alignItems:'center', gap:8},
+  tlLabel:           {fontSize:12, color:C.subText, width:56},
+  tlMeta:            {fontSize:10, color:C.dimText},
+  sectionTitle:      {fontSize:12, fontWeight:'800', color:'#222'},
+  sectionDesc:       {fontSize:11, color:C.subText},
+  row:               {gap:5},
+  label:             {fontSize:12, color:C.subText},
+  // 정보 박스
+  infoBox:           {backgroundColor:'#EEF2FF', borderRadius:8, padding:10},
+  infoText:          {fontSize:11, color:C.navy, lineHeight:16},
+  timeRow:           {flexDirection:'row', alignItems:'flex-end', gap:8},
+  timeBox:           {borderWidth:1.5, borderRadius:8, paddingVertical:10, alignItems:'center', marginTop:4},
+  timeVal:           {fontSize:15, fontWeight:'800', letterSpacing:1},
+  // 조회 행
+  queryRow:          {flexDirection:'row', paddingVertical:5, borderBottomWidth:1, borderBottomColor:'#F0F0F0'},
+  queryLabel:        {fontSize:12, color:C.subText, width:70},
+  queryVal:          {fontSize:12, fontWeight:'600', color:'#222', flex:1},
+  // 빈 상태
+  emptyBox:          {alignItems:'center', paddingVertical:40},
+  emptyText:         {fontSize:13, color:C.dimText},
+  // 로그
+  logBox:            {borderWidth:1, borderColor:C.border, borderRadius:10, padding:12, backgroundColor:'#F8F9FA'},
+  logTitle:          {fontSize:12, fontWeight:'700', color:'#333'},
+  logLine:           {fontSize:11, lineHeight:18, fontFamily:'monospace' as any},
+});

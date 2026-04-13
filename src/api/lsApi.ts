@@ -110,14 +110,75 @@ export const getAccountPeriodPnl = async (
 
 // ============================
 // 선물옵션 계좌잔고 및 평가현황 (CFOAQ50600)
+// BalEvalTp: '2' = 선입선출법 (HTS 기준과 동일)
 // ============================
-export const getFuturesBalance = async () => {
-  return postApi('/futureoption/accno', 'CFOAQ50600', {
+export interface FuturesBalanceHolding {
+  fnoIsuNo:    string;  // 종목번호
+  isuNm:       string;  // 종목명 (예: F 2606)
+  bnsTpNm:     string;  // 매매구분명 (매수/매도)
+  bnsTpCode:   string;  // 매매구분코드 (1:매도 2:매수)
+  unsttQty:    number;  // 미결제수량 (잔고)
+  lqdtAbleQty: number;  // 청산가능수량
+  fnoAvrPrc:   number;  // 평균가
+  fnoNowPrc:   number;  // 현재가
+  evalAmt:     number;  // 평가금액
+  evalPnl:     number;  // 평가손익
+  pnlRat:      number;  // 손익율
+  bnsplAmt:    number;  // 매매손익금액
+}
+
+export interface FuturesBalanceSummary {
+  acntNm:           string;  // 계좌명
+  evalDpsamtTotamt: number;  // 평가예탁금총액
+  futsEvalPnlAmt:   number;  // 선물평가손익금액
+  optEvalPnlAmt:    number;  // 옵션평가손익금액
+  totPnlAmt:        number;  // 총손익금액
+  mnyOrdAbleAmt:    number;  // 현금주문가능금액
+}
+
+export const getFuturesBalance = async (): Promise<{
+  summary:  FuturesBalanceSummary;
+  holdings: FuturesBalanceHolding[];
+}> => {
+  const today = new Date();
+  const ordDt = `${today.getFullYear()}${String(today.getMonth()+1).padStart(2,'0')}${String(today.getDate()).padStart(2,'0')}`;
+
+  const res = await postApi('/futureoption/accno', 'CFOAQ50600', {
     CFOAQ50600InBlock1: {
-      RecCnt: 1, OrdDt: '20260301', BalEvalTp: '2',
-      FutsPrcEvalTp: '2', LqtQtyQryTp: '1',
+      RecCnt: 1, OrdDt: ordDt,
+      BalEvalTp:    '2',  // 선입선출법 → HTS 기준과 동일
+      FutsPrcEvalTp: '2', // 전일종가 기준
+      LqtQtyQryTp:  '1',
     },
   });
+
+  const b2 = res.CFOAQ50600OutBlock2 ?? {};
+  const b3 = Array.isArray(res.CFOAQ50600OutBlock3) ? res.CFOAQ50600OutBlock3 : [];
+
+  return {
+    summary: {
+      acntNm:           String(b2.AcntNm            ?? ''),
+      evalDpsamtTotamt: Number(b2.EvalDpsamtTotamt  ?? 0),
+      futsEvalPnlAmt:   Number(b2.FutsEvalPnlAmt    ?? 0),
+      optEvalPnlAmt:    Number(b2.OptEvalPnlAmt      ?? 0),
+      totPnlAmt:        Number(b2.TotPnlAmt          ?? 0),
+      mnyOrdAbleAmt:    Number(b2.MnyOrdAbleAmt      ?? 0),
+    },
+    holdings: b3.map((r: any) => ({
+      fnoIsuNo:    String(r.FnoIsuNo    ?? ''),
+      isuNm:       String(r.IsuNm       ?? ''),
+      bnsTpNm:     String(r.BnsTpNm     ?? ''),
+      bnsTpCode:   String(r.BnsTpCode   ?? ''),
+      unsttQty:    Number(r.UnsttQty    ?? 0),
+      lqdtAbleQty: Number(r.LqdtAbleQty ?? 0),
+      fnoAvrPrc:   Number(r.FnoAvrPrc   ?? 0),
+      fnoNowPrc:   Number(r.FnoNowPrc   ?? 0),
+      evalAmt:     Number(r.EvalAmt     ?? 0),
+      evalPnl:     Number(r.EvalPnl     ?? 0),
+      pnlRat:      Number(r.PnlRat      ?? 0),
+      bnsplAmt:    Number(r.BnsplAmt    ?? 0),
+    })),
+  };
 };
 
 // ============================
@@ -267,7 +328,7 @@ export const getFuturesHoldings = async (): Promise<{
 // ============================
 // 옵션 전광판 (t2301)
 // gubun: 'G'=정규 'M'=미니 'W'=위클리
-// yyyymm: 정규/미니='202604', 위클리='W1 '(공백포함)
+// yyyymm: 정규/미니='202604', 위클리 월요일='W1 ', 위클리 목요일='W2 '
 // ============================
 export interface OptionItem {
   actprice: number; optcode: string; price: number; sign: string;
@@ -315,6 +376,14 @@ export const getOptionBoard = async (
     calls: b1.map(parseItem),
     puts:  b2.map(parseItem),
   };
+};
+
+// 위클리 옵션 전광판 — 월요일('W1 ')과 목요일('W2 ') 분리 조회
+export const getWeeklyOptionBoard = async (
+  weekDay: '월' | '목',
+): Promise<OptionBoard> => {
+  const yyyymm = weekDay === '월' ? 'W1 ' : 'W2 ';
+  return getOptionBoard(yyyymm, 'W');
 };
 
 // ============================

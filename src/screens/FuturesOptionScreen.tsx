@@ -3,6 +3,7 @@ import {
   View, Text, StyleSheet, ScrollView, TouchableOpacity,
   StatusBar, Modal, ActivityIndicator, Dimensions,
 } from 'react-native';
+import Svg, { Circle, Path } from 'react-native-svg';
 import {useNavigation, useRoute, RouteProp} from '@react-navigation/native';
 import {NativeStackNavigationProp} from '@react-navigation/native-stack';
 import {RootStackParamList} from '../navigation/RootNavigator';
@@ -358,12 +359,12 @@ const FuturesOptionScreen = () => {
               <Text style={sc.dayBtnText}>야간</Text>
             </View>
           </View>
-          <View style={sc.searchIcon}>
-            <TouchableOpacity onPress={() => navigation.navigate('FuturesSearch')} hitSlop={{top:10,bottom:10,left:10,right:10}}>
-              <View style={sc.searchCircle}/>
-              <View style={sc.searchHandle}/>
-            </TouchableOpacity>
-          </View>
+          <TouchableOpacity onPress={() => navigation.navigate('FuturesSearch')} hitSlop={{top:12,bottom:12,left:12,right:12}}>
+            <Svg width={22} height={22} viewBox="0 0 24 24" fill="none">
+              <Circle cx={10} cy={10} r={6.5} stroke="#111" strokeWidth={2} strokeLinecap="round"/>
+              <Path d="M15.5 15.5L21 21" stroke="#111" strokeWidth={2} strokeLinecap="round"/>
+            </Svg>
+          </TouchableOpacity>
           <View style={sc.dotsWrap}>
             {[0,1,2].map(i => <View key={i} style={sc.dot}/>)}
           </View>
@@ -573,9 +574,6 @@ const sc = StyleSheet.create({
   dayBtnActive:        {},
   dayBtnActiveText:    {fontSize: 13, fontWeight: '700', color: C.navy},
   dayBtnText:          {fontSize: 13, color: C.dimText},
-  searchIcon:          {width: 22, height: 22, position: 'relative'},
-  searchCircle:        {width: 14, height: 14, borderRadius: 7, borderWidth: 2, borderColor: '#111', position: 'absolute', top: 0, left: 0},
-  searchHandle:        {width: 7, height: 2, backgroundColor: '#111', borderRadius: 1, transform: [{rotate: '45deg'}], position: 'absolute', bottom: 1, right: 0},
   dotsWrap:            {gap: 4},
   dot:                 {width: 4, height: 4, borderRadius: 2, backgroundColor: '#111'},
   priceSection:        {paddingHorizontal: 14, paddingBottom: 8, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end'},
