@@ -36,7 +36,7 @@ const C = {
 };
 
 type MainTab    = '호가' | '옵션전광판';
-type OrderMode  = '매수' | '매도' | '정정/취소' | '체결' | '잔고';
+type OrderMode  = '매수' | '매도' | '정정/취소' | '체결' | '잔고' | '자동화';
 type OptionView = '전체' | '콜' | '풋';
 
 interface BookRow { price: number; qty: number; }
@@ -153,7 +153,10 @@ const HogaBottomSheet = ({visible, data, onClose, onOrder}: {
           <TouchableOpacity style={[bs.btn, {backgroundColor: C.blue}]} onPress={() => { onClose(); onOrder('매도', data.price); }}>
             <Text style={bs.btnText}>매도</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={[bs.btn, {backgroundColor: C.mutedBg}]}>
+          <TouchableOpacity style={[bs.btn, {backgroundColor: '#00897B'}]} onPress={() => { onClose(); onOrder('자동화', data.price); }}>
+            <Text style={bs.btnText}>자동화</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[bs.btn, {backgroundColor: C.mutedBg}]} onPress={() => { onClose(); onOrder('정정/취소', data.price); }}>
             <Text style={[bs.btnText, {color: C.darkNavy}]}>정정 / 취소</Text>
           </TouchableOpacity>
         </TouchableOpacity>

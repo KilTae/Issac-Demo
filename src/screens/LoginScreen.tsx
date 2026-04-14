@@ -1,4 +1,4 @@
-import React, {useState} from 'react';
+import React, {useState, useEffect} from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity,
   TextInput, StatusBar, KeyboardAvoidingView,
@@ -6,9 +6,11 @@ import {
 } from 'react-native';
 import {SafeAreaView} from 'react-native-safe-area-context';
 import {NativeStackScreenProps} from '@react-navigation/native-stack';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import {RootStackParamList} from '../navigation/RootNavigator';
-// 📁 파일 위치 확인: src/api/lsApi.ts 에 있어야 해요
- import {getAccessToken} from '../api/lsApi';
+import {setApiKeys, getAccessToken} from '../api/lsApi';
+
+const SAVE_KEY = 'savedApiKeys';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Login'>;
 
@@ -20,19 +22,45 @@ const LoginScreen = ({navigation}: Props) => {
   const [saveKey,    setSaveKey]    = useState(false);
   const [loading,    setLoading]    = useState(false);
 
+  // 앱 시작 시 저장된 키 불러오기
+  useEffect(() => {
+    AsyncStorage.getItem(SAVE_KEY).then(val => {
+      if (val) {
+        try {
+          const {appKey: ak, secretKey: sk} = JSON.parse(val);
+          if (ak && sk) {
+            setAppKey(ak);
+            setSecretKey(sk);
+            setSaveKey(true);
+          }
+        } catch {}
+      }
+    });
+  }, []);
+
   const isReady = appKey.trim().length > 0 && secretKey.trim().length > 0;
 
   const handleConnect = async () => {
     if (!isReady) return;
     setLoading(true);
     try {
-      // 1. lsApi에 키 저장
-     // setApiKeys(appKey.trim(), secretKey.trim());
+      const trimmedKey    = appKey.trim();
+      const trimmedSecret = secretKey.trim();
+
+      // 1. 입력받은 키를 lsApi에 세팅 (기존 토큰 초기화 포함)
+      setApiKeys(trimmedKey, trimmedSecret);
 
       // 2. 토큰 발급 시도 (키 유효성 확인)
       await getAccessToken();
 
-      // 3. 성공 → 메인으로 이동
+      // 3. 키 저장 여부 처리
+      if (saveKey) {
+        await AsyncStorage.setItem(SAVE_KEY, JSON.stringify({appKey: trimmedKey, secretKey: trimmedSecret}));
+      } else {
+        await AsyncStorage.removeItem(SAVE_KEY);
+      }
+
+      // 4. 성공 → 메인으로 이동
       navigation.replace('Main');
     } catch (e: any) {
       Alert.alert(

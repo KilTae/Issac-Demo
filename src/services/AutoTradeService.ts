@@ -2,11 +2,35 @@ import BackgroundService from 'react-native-background-actions';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   getFuturesPrice, getFuturesHoga, placeOrder, getWeeklyOptionBoard,
+  getKospi200MinuteBars,
 } from '../api/lsApi';
 
 const STORAGE_KEY   = 'autoConfigs';
 const LOG_KEY       = 'autoLogs';
 const STATUS_KEY    = 'autoServiceStatus'; // 'running' | 'stopped'
+const RESULT_KEY    = 'autoResults';       // 백그라운드 실행 결과 이벤트 목록
+
+// ── 결과 이벤트 저장 ──────────────────────────────────────────────────────────
+type ResultType = 'futures_buy' | 'next_weekly' | 'exit' | 'error';
+interface ResultEvent {
+  type:      ResultType;
+  ts:        string;
+  optCode:   string;
+  message:   string;
+  detail?:   string;
+}
+
+const appendResult = async (event: ResultEvent) => {
+  try {
+    const val  = await AsyncStorage.getItem(RESULT_KEY);
+    const list: ResultEvent[] = val ? JSON.parse(val) : [];
+    list.unshift(event);
+    await AsyncStorage.setItem(RESULT_KEY, JSON.stringify(list.slice(0, 50)));
+    console.log('💾 appendResult 저장 완료:', event.type, event.message);
+  } catch (e: any) {
+    console.log('❌ appendResult 저장 실패:', e?.message);
+  }
+};
 
 // ── KST 시간 반환 ─────────────────────────────────────────────────────────────
 const nowKST = (): string => {
@@ -57,6 +81,15 @@ const findNextWeeklyPutCode = async (
   return null;
 };
 
+// ── 시간 문자열 → 분 변환 ──────────────────────────────────────────────────────
+const toMinutes = (hhmm: string): number => {
+  const [h, m] = hhmm.split(':').map(Number);
+  return h * 60 + m;
+};
+
+// ── 종목별 샘플 저장소 (백그라운드용) ────────────────────────────────────────
+const kospiSampleMap: Record<string, number[]> = {};
+
 // ── 단일 자동화 설정 실행 ─────────────────────────────────────────────────────
 const runSingleConfig = async (cfg: any) => {
   const now = nowKST();
@@ -70,8 +103,36 @@ const runSingleConfig = async (cfg: any) => {
     await appendLog(`[${cfg.putOptCode}] ⏰ 마감 시각 ${cfg.orderDeadline} 도달`);
     const futCode   = cfg.futuresCode || 'A0166000';
     const priceData = await getFuturesPrice(futCode);
-    const kospi200  = priceData.kospijisu;
     const futPrice  = priceData.price;
+
+    // ── 코스피200 결정: 샘플 평균 or 현재값 폴백 ─────────────────────────────
+    let kospi200: number;
+    const samples = kospiSampleMap[cfg.putOptCode] ?? [];
+    if (samples.length > 0) {
+      kospi200 = +(samples.reduce((a, b) => a + b, 0) / samples.length).toFixed(2);
+      // 샘플 목록 상세 로그
+      const deadlineMin2 = toMinutes(cfg.orderDeadline.slice(0, 5));
+      const sampleStart2 = deadlineMin2 - 10;
+      const sampleList = samples
+        .map((v, i) => {
+          const m = sampleStart2 + i;
+          return `${String(Math.floor(m/60)).padStart(2,'0')}:${String(m%60).padStart(2,'0')}→${v.toFixed(2)}`;
+        })
+        .join(' / ');
+      await appendLog(`[${cfg.putOptCode}] 📊 샘플 목록 [${samples.length}개]: ${sampleList}`);
+      await appendLog(`[${cfg.putOptCode}] 📊 코스피200 평균 (${samples.length}개): ${kospi200.toFixed(2)}`);
+    } else {
+      try {
+        const fallbackBars = await getKospi200MinuteBars(2, '101');
+        kospi200 = fallbackBars[0]?.close ?? priceData.kospijisu;
+      } catch {
+        kospi200 = priceData.kospijisu;
+      }
+      await appendLog(`[${cfg.putOptCode}] 📊 코스피200 현재값 사용 (샘플 없음, t8418): ${kospi200.toFixed(2)}`);
+    }
+    // 사용 후 샘플 초기화
+    delete kospiSampleMap[cfg.putOptCode];
+
     await appendLog(`[${cfg.putOptCode}] 마감 코스피200: ${kospi200.toFixed(2)} / 행사가: ${cfg.putStrike}`);
 
     if (kospi200 < cfg.putStrike) {
@@ -87,8 +148,29 @@ const runSingleConfig = async (cfg: any) => {
         });
         const b2 = res.CFOAT00100OutBlock2;
         await appendLog(`[${cfg.putOptCode}] ✅ 선물 매수 완료 — 주문번호: ${b2?.OrdNo ?? '-'}`);
+        const sampleDetailBg = samples.length > 0
+          ? `\n\n[코스피200 샘플 ${samples.length}개]\n` + samples.map((v, i) => {
+              const dm = toMinutes(cfg.orderDeadline.slice(0, 5));
+              const m = (dm - 10) + i;
+              return `${String(Math.floor(m/60)).padStart(2,'0')}:${String(m%60).padStart(2,'0')} → ${v.toFixed(2)}`;
+            }).join('\n') + `\n평균: ${kospi200.toFixed(2)}`
+          : `\n코스피200: ${kospi200.toFixed(2)} (실시간 단일값)`;
+        await appendResult({
+          type:    'futures_buy',
+          ts:      nowKST(),
+          optCode: cfg.putOptCode,
+          message: `✅ 선물 자동 매수 완료`,
+          detail:  `종목: ${cfg.futuresCode}\n주문번호: ${b2?.OrdNo ?? '-'}\n수량: ${cfg.futuresQty}계약\n가격: ${(futPrice + 0.5).toFixed(2)}${sampleDetailBg}`,
+        });
       } catch (e: any) {
         await appendLog(`[${cfg.putOptCode}] ❌ 선물 매수 실패: ${e?.message}`);
+        await appendResult({
+          type:    'error',
+          ts:      nowKST(),
+          optCode: cfg.putOptCode,
+          message: `❌ 선물 매수 실패`,
+          detail:  e?.message ?? '알 수 없는 오류',
+        });
       }
     } else {
       // 다음 위클리 탐색
@@ -102,6 +184,13 @@ const runSingleConfig = async (cfg: any) => {
         all[result.optcode] = { ...cfg, putOptCode: result.optcode, putOptHname: result.nextHname };
         await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(all));
         await appendLog(`[${cfg.putOptCode}] 🔄 다음 위클리 변경: ${result.optcode}`);
+        await appendResult({
+          type:    'next_weekly',
+          ts:      nowKST(),
+          optCode: cfg.putOptCode,
+          message: `📋 다음 위클리 풋매도 진입 필요`,
+          detail:  `코스피200 현물(${kospi200.toFixed(2)})이 행사가(${cfg.putStrike})보다 높습니다.\n\n현재 풋옵션은 안전하게 만기 소멸됩니다.\n다음 위클리 풋옵션으로 매도 진입하세요.`,
+        });
       }
     }
 
@@ -113,7 +202,7 @@ const runSingleConfig = async (cfg: any) => {
     return;
   }
 
-  // 모니터링 중 — 청산 조건 체크
+  // 모니터링 중 — 샘플 수집 + 청산 조건 체크
   try {
     const futCode   = cfg.futuresCode || 'A0166000';
     const priceData = await getFuturesPrice(futCode);
@@ -122,7 +211,121 @@ const runSingleConfig = async (cfg: any) => {
     const optHoga   = await getFuturesHoga(cfg.putOptCode);
     const optPrice  = optHoga.price;
 
-    await appendLog(`[${cfg.putOptCode}] 코스피: ${kospi200.toFixed(2)} | 옵션: ${optPrice.toFixed(2)}P | 선물: ${futPrice.toFixed(2)}`);
+    // ── 코스피200 샘플 수집 (deadline 10분 전부터 1분 간격) ──────────────────
+    const nowMin      = toMinutes(now.slice(0, 5));
+    const deadlineMin = toMinutes(cfg.orderDeadline.slice(0, 5));
+    const sampleStart = deadlineMin - 10;
+    const nowSec      = parseInt(now.slice(6, 8), 10);
+
+    // 처음 수집 구간 진입 시 t8418로 코스피200 현물지수 분봉 소급
+    if (!kospiSampleMap[cfg.putOptCode]) {
+      kospiSampleMap[cfg.putOptCode] = [];
+
+      const missedCount = Math.max(0, nowMin - sampleStart);
+      if (missedCount > 0) {
+        await appendLog(`[${cfg.putOptCode}] 🔍 코스피200 분봉 소급 조회 (t8418) — ${missedCount}개 필요`);
+        try {
+          const bars = await getKospi200MinuteBars(missedCount + 3, '101');
+          // API는 최신순 → 시간 오름차순 정렬 (과거→최신)
+          const sorted = [...bars].sort((a, b) => {
+            const toMin = (t: string) => parseInt(t.slice(0,2),10)*60 + parseInt(t.slice(2,4),10);
+            return toMin(a.time) - toMin(b.time);
+          });
+          const backfilled: { min: number; val: number }[] = [];
+
+          for (const b of sorted) {
+            const t = b.time; // "HHMMSS"
+            if (t.length < 6) continue;
+            const hh = parseInt(t.slice(0, 2), 10);
+            const mm = parseInt(t.slice(2, 4), 10);
+            const ss = parseInt(t.slice(4, 6), 10);
+            const barMin = hh * 60 + mm;
+            const timeDisplay = `${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}:${String(ss).padStart(2,'0')}`;
+            const kospiVal = b.close;
+
+            if (barMin >= sampleStart && barMin < nowMin && kospiVal > 0) {
+              backfilled.push({ min: barMin, val: kospiVal });
+              await appendLog(`[${cfg.putOptCode}] 📈 소급 [${backfilled.length}] ${timeDisplay} → ${kospiVal.toFixed(2)}`);
+            } else {
+              await appendLog(`[${cfg.putOptCode}] ⏭ 스킵 | ${timeDisplay} | barMin=${barMin} | close=${kospiVal}`);
+            }
+          }
+
+          if (backfilled.length > 0) {
+            kospiSampleMap[cfg.putOptCode] = backfilled.map(x => x.val);
+            const avg = (backfilled.reduce((a, b) => a + b.val, 0) / backfilled.length).toFixed(2);
+            const sampleListStr = backfilled
+              .map(x => `${String(Math.floor(x.min/60)).padStart(2,'0')}:${String(x.min%60).padStart(2,'0')}→${x.val.toFixed(2)}`)
+              .join(' / ');
+            await appendLog(`[${cfg.putOptCode}] ✅ 소급 완료 — ${backfilled.length}개`);
+            await appendLog(`[${cfg.putOptCode}] 📋 소급 샘플: [${sampleListStr}]`);
+            await appendLog(`[${cfg.putOptCode}] 📊 현재 평균: ${avg} / 앞으로 ${10 - backfilled.length}개 실시간 수집 예정`);
+          } else {
+            await appendLog(`[${cfg.putOptCode}] ⚠️ 소급 범위 내 데이터 없음 — 실시간 수집만 사용`);
+          }
+        } catch (e: any) {
+          await appendLog(`[${cfg.putOptCode}] ❌ t8418 소급 실패: ${e?.message}`);
+        }
+      }
+    }
+
+    // 수집 구간 진입 전 — 몇 분 후 시작인지 안내
+    if (nowMin < sampleStart && nowSec < 15) {
+      const remainMin = sampleStart - nowMin;
+      const sHH = String(Math.floor(sampleStart / 60)).padStart(2, '0');
+      const sMM = String(sampleStart % 60).padStart(2, '0');
+      await appendLog(`[${cfg.putOptCode}] ⏳ 샘플 수집 대기 — ${sHH}:${sMM} 부터 시작 (${remainMin}분 후)`);
+    }
+
+    // 수집 구간 — 1분 간격 수집
+    if (nowMin >= sampleStart && nowMin < deadlineMin && nowSec < 15) {
+      if (!kospiSampleMap[cfg.putOptCode]) kospiSampleMap[cfg.putOptCode] = [];
+      const samples = kospiSampleMap[cfg.putOptCode];
+      const expectedCount = nowMin - sampleStart;
+      const slotHH = String(Math.floor(nowMin / 60)).padStart(2, '0');
+      const slotMM = String(nowMin % 60).padStart(2, '0');
+
+      if (samples.length < expectedCount) {  // 소급 슬롯 중복 방지
+        // t8418로 현재 분의 코스피200 현물지수 조회
+        let kospi200Realtime = kospi200;
+        try {
+          const realtimeBars = await getKospi200MinuteBars(2, '101');
+          kospi200Realtime = realtimeBars[0]?.close ?? kospi200;
+        } catch { /* t2101 폴백 */ }
+        samples.push(kospi200Realtime);
+        const remaining = 10 - samples.length;
+        await appendLog(
+          `[${cfg.putOptCode}] 📈 샘플 [${samples.length}/10]` +
+          ` | 시각: ${slotHH}:${slotMM}:${String(nowSec).padStart(2,'0')}` +
+          ` | 코스피200: ${kospi200Realtime.toFixed(2)}` +
+          ` | 남은: ${remaining}개 | 마감까지: ${deadlineMin - nowMin}분`,
+        );
+        const sampleList = samples
+          .map((v, i) => {
+            const m = sampleStart + i;
+            const h = String(Math.floor(m / 60)).padStart(2, '0');
+            const mm2 = String(m % 60).padStart(2, '0');
+            return `${h}:${mm2}→${v.toFixed(2)}`;
+          })
+          .join(' / ');
+        await appendLog(`[${cfg.putOptCode}] 📋 누적 샘플: [${sampleList}]`);
+      } else {
+        await appendLog(
+          `[${cfg.putOptCode}] ⏭ ${slotHH}:${slotMM} 슬롯 이미 수집됨 (count=${samples.length})`,
+        );
+      }
+    }
+
+    // 수집 구간 내 정각이 아닐 때
+    if (nowMin >= sampleStart && nowMin < deadlineMin && nowSec >= 15) {
+      const currentCount = kospiSampleMap[cfg.putOptCode]?.length ?? 0;
+      await appendLog(
+        `[${cfg.putOptCode}] 🕐 수집 진행 중 [${currentCount}/10]` +
+        ` | ${now.slice(0,8)} | 다음 수집까지 약 ${60 - nowSec}초`,
+      );
+    }
+
+    await appendLog(`[${cfg.putOptCode}] 코스피: ${kospi200.toFixed(2)} | 옵션: ${optPrice.toFixed(2)}P | 선물: ${futPrice.toFixed(2)}${(kospiSampleMap[cfg.putOptCode]?.length ?? 0) > 0 ? ` | 샘플 ${kospiSampleMap[cfg.putOptCode].length}/10` : ''}`);
 
     if (cfg.exitEnabled && optPrice <= cfg.exitThreshold) {
       await appendLog(`[${cfg.putOptCode}] ⚠️ 청산 조건 충족 — 주문 시작`);
@@ -136,6 +339,13 @@ const runSingleConfig = async (cfg: any) => {
         });
         const b2 = res.CFOAT00100OutBlock2;
         await appendLog(`[${cfg.putOptCode}] ✅ 청산 완료 — 주문번호: ${b2?.OrdNo ?? '-'}`);
+        await appendResult({
+          type:    'exit',
+          ts:      nowKST(),
+          optCode: cfg.putOptCode,
+          message: `✅ 풋옵션 자동 청산 완료`,
+          detail:  `종목: ${cfg.putOptCode}\n주문번호: ${b2?.OrdNo ?? '-'}\n청산가: ${optPrice.toFixed(2)}P\n(기준가: ${cfg.exitThreshold.toFixed(2)}P 이하 도달)`,
+        });
 
         // 완료된 설정 삭제
         const val = await AsyncStorage.getItem(STORAGE_KEY);
@@ -144,6 +354,13 @@ const runSingleConfig = async (cfg: any) => {
         await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(all));
       } catch (e: any) {
         await appendLog(`[${cfg.putOptCode}] ❌ 청산 실패: ${e?.message}`);
+        await appendResult({
+          type:    'error',
+          ts:      nowKST(),
+          optCode: cfg.putOptCode,
+          message: `❌ 풋옵션 청산 실패`,
+          detail:  e?.message ?? '알 수 없는 오류',
+        });
       }
     }
   } catch (e: any) {
@@ -233,4 +450,17 @@ export const getBackgroundLogs = async (): Promise<string[]> => {
 
 export const clearBackgroundLogs = async () => {
   await AsyncStorage.removeItem(LOG_KEY);
+};
+
+export const getAutoResults = async (): Promise<ResultEvent[]> => {
+  try {
+    const val = await AsyncStorage.getItem(RESULT_KEY);
+    return val ? JSON.parse(val) : [];
+  } catch {
+    return [];
+  }
+};
+
+export const clearAutoResults = async () => {
+  await AsyncStorage.removeItem(RESULT_KEY);
 };

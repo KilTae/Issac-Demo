@@ -4,7 +4,7 @@ import {
   TouchableOpacity, StatusBar, ActivityIndicator, Modal, TextInput, Keyboard,
 } from 'react-native';
 import {SafeAreaView} from 'react-native-safe-area-context';
-import {useNavigation} from '@react-navigation/native';
+import {useNavigation, useRoute, RouteProp} from '@react-navigation/native';
 import {NativeStackNavigationProp} from '@react-navigation/native-stack';
 import {RootStackParamList} from '../navigation/RootNavigator';
 import {getOptionBoard, getWeeklyOptionBoard} from '../api/lsApi';
@@ -193,17 +193,21 @@ const generateKQ150FuturesSearchItems = (): SearchItem[] =>
     type: 'KQ150선물' as const, strike: 0, price: 0, chg: 0, sign: '3',
   }));
 
+const REFRESH_MS = 10_000; // 10초 자동 갱신
+
 // ── 메인 ─────────────────────────────────────────────────────────────────────
 const FuturesSearchScreen = () => {
   const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
+  const route = useRoute();
+  const selectMode = (route.params as any)?.selectMode ?? false;
+  console.log('🔍 FuturesSearchScreen selectMode:', selectMode, '/ params:', route.params);
 
   const { tabs: weeklyTabs, defaultDay } = useMemo(() => getNextWeeklyExpiries(), []);
 
   const kp200ScrollRef  = useRef<ScrollView>(null) as React.MutableRefObject<ScrollView>;
   const weeklyScrollRef = useRef<ScrollView>(null) as React.MutableRefObject<ScrollView>;
   const kq150ScrollRef  = useRef<ScrollView>(null) as React.MutableRefObject<ScrollView>;
-  const isFirstMount    = useRef(true);
-  const isFirstKQ150    = useRef(true);
+  const kq150Initialized = useRef(false);
   const searchInputRef  = useRef<TextInput>(null);
 
   const [mainTab,             setMainTab]             = useState<MainTab>('주간');
@@ -324,12 +328,28 @@ const FuturesSearchScreen = () => {
     );
   }, [searchItems, searchQuery]);
 
+  const handleItemPress = useCallback((shcode: string, hname: string, yyyymm: string = '') => {
+    if (selectMode) {
+      // selectMode: goBack하면서 selectedOpt 파라미터로 전달
+      const state = navigation.getState();
+      const orderRoute = state.routes.find((r: any) => r.name === 'Order') as any;
+      if (orderRoute?.params) {
+        navigation.navigate('Order', {
+          ...orderRoute.params,
+          selectedOpt: { shcode, hname },
+        });
+      } else {
+        navigation.goBack();
+      }
+    } else {
+      navigation.navigate('FuturesOption', { shcode, hname, yyyymm });
+    }
+  }, [navigation, selectMode]);
+
   const handleSearchSelect = useCallback((item: SearchItem) => {
     closeSearch();
-    navigation.navigate('FuturesOption', {
-      shcode: item.shcode, hname: item.hname, yyyymm: item.yyyymm,
-    });
-  }, [navigation, closeSearch]);
+    handleItemPress(item.shcode, item.hname, item.yyyymm ?? '');
+  }, [closeSearch, handleItemPress]);
 
   const getBadge = (type: SearchItem['type']) => {
     switch (type) {
@@ -397,8 +417,8 @@ const FuturesSearchScreen = () => {
   }, []);
 
   // ── KP200 ─────────────────────────────────────────────────────────────────
-  const fetchKP200Options = useCallback(async (yyyymm: string) => {
-    setKp200Loading(true);
+  const fetchKP200Options = useCallback(async (yyyymm: string, showLoading = true) => {
+    if (showLoading) setKp200Loading(true);
     try {
       const board = await getOptionBoard(yyyymm, 'G');
       const map = new Map<number, {call?: any; put?: any}>();
@@ -406,11 +426,11 @@ const FuturesSearchScreen = () => {
       board.puts.forEach(p  => map.set(p.actprice, {...(map.get(p.actprice) ?? {}), put:  p}));
       const newRows = buildRowsFromMap(map, board.summary.gmprice);
       setKp200Rows(newRows);
-      scrollToATM(newRows, kp200ScrollRef);
+      if (showLoading) scrollToATM(newRows, kp200ScrollRef);
     } catch (e: any) {
       console.log('❌ KP200 조회 실패:', e?.message);
     } finally {
-      setKp200Loading(false);
+      if (showLoading) setKp200Loading(false);
     }
   }, [buildRowsFromMap, scrollToATM]);
 
@@ -423,8 +443,8 @@ const FuturesSearchScreen = () => {
   }, [fetchKP200Options]);
 
   // ── KQ150 ─────────────────────────────────────────────────────────────────
-  const fetchKQ150Options = useCallback(async (yyyymm: string) => {
-    setKq150Loading(true);
+  const fetchKQ150Options = useCallback(async (yyyymm: string, showLoading = true) => {
+    if (showLoading) setKq150Loading(true);
     try {
       const board = await getOptionBoard(yyyymm, 'Q');
       const map = new Map<number, {call?: any; put?: any}>();
@@ -432,11 +452,11 @@ const FuturesSearchScreen = () => {
       board.puts.forEach(p  => map.set(p.actprice, {...(map.get(p.actprice) ?? {}), put:  p}));
       const newRows = buildRowsFromMap(map, board.summary.gmprice);
       setKq150Rows(newRows);
-      scrollToATM(newRows, kq150ScrollRef);
+      if (showLoading) scrollToATM(newRows, kq150ScrollRef);
     } catch (e: any) {
       console.log('❌ KQ150 조회 실패:', e?.message);
     } finally {
-      setKq150Loading(false);
+      if (showLoading) setKq150Loading(false);
     }
   }, [buildRowsFromMap, scrollToATM]);
 
@@ -452,7 +472,6 @@ const FuturesSearchScreen = () => {
   const weeklyCacheRef = useRef<Partial<Record<WeekDay, {
     calls: any[]; puts: any[]; gmprice: number; ts: number;
   }>>>({});
-  const CACHE_TTL_MS = 60_000;
 
   const buildWeeklyRows = useCallback((calls: any[], puts: any[], gmp: number) => {
     const map = new Map<number, {call?: any; put?: any}>();
@@ -463,16 +482,8 @@ const FuturesSearchScreen = () => {
     scrollToATM(newRows, weeklyScrollRef);
   }, [buildRowsFromMap, scrollToATM]);
 
-  const fetchWeekly = useCallback(async (day: WeekDay, retry = 0) => {
-    const cached = weeklyCacheRef.current[day];
-    if (cached && Date.now() - cached.ts < CACHE_TTL_MS) {
-      setGmprice(cached.gmprice);
-      setAllCalls(cached.calls);
-      setAllPuts(cached.puts);
-      buildWeeklyRows(cached.calls, cached.puts, cached.gmprice);
-      return;
-    }
-    setLoading(true);
+  const fetchWeekly = useCallback(async (day: WeekDay, showLoading = true, retry = 0) => {
+    if (showLoading) setLoading(true);
     try {
       const board = await getWeeklyOptionBoard(day);
       weeklyCacheRef.current[day] = {
@@ -487,14 +498,13 @@ const FuturesSearchScreen = () => {
       const msg: string = e?.message ?? '';
       if (msg.includes('초과') && retry < 3) {
         const delay = (retry + 1) * 1000;
-        setTimeout(() => fetchWeekly(day, retry + 1), delay);
+        setTimeout(() => fetchWeekly(day, showLoading, retry + 1), delay);
       } else {
         console.log(`❌ 위클리(${day}) 조회 실패:`, msg);
-        setLoading(false);
       }
       return;
     } finally {
-      setLoading(false);
+      if (showLoading) setLoading(false);
     }
   }, [buildWeeklyRows]);
 
@@ -508,9 +518,15 @@ const FuturesSearchScreen = () => {
   }, []);
 
   useEffect(() => {
-    if (isFirstMount.current) { isFirstMount.current = false; return; }
     if (selectedExpiry) fetchKP200Options(selectedExpiry);
-  }, [selectedExpiry]);
+  }, [selectedExpiry]);  // 최초 mount 시엔 selectedExpiry가 ''이므로 자동 skip
+
+  // KP200 탭 10초 자동 갱신
+  useEffect(() => {
+    if (productTab !== 'KP200' || !selectedExpiry) return;
+    const id = setInterval(() => fetchKP200Options(selectedExpiry, false), REFRESH_MS);
+    return () => clearInterval(id);
+  }, [productTab, selectedExpiry, fetchKP200Options]);
 
   useEffect(() => {
     if (allCalls.length > 0 || allPuts.length > 0) buildWeeklyRows(allCalls, allPuts, gmprice);
@@ -518,33 +534,42 @@ const FuturesSearchScreen = () => {
 
   useEffect(() => {
     if (productTab !== '위클리') return;
-    const timer = setTimeout(() => fetchWeekly(weekDay), 700);
+    const timer = setTimeout(() => fetchWeekly(weekDay, true), 700);
     return () => clearTimeout(timer);
   }, [weekDay]);
+
+  // 위클리 탭 10초 자동 갱신
+  useEffect(() => {
+    if (productTab !== '위클리') return;
+    const id = setInterval(() => fetchWeekly(weekDay, false), REFRESH_MS);
+    return () => clearInterval(id);
+  }, [productTab, weekDay, fetchWeekly]);
 
   // KQ150 탭 처음 진입 시 데이터 로드
   useEffect(() => {
     if (productTab !== 'KQ150') return;
-    if (isFirstKQ150.current) {
-      isFirstKQ150.current = false;
+    if (!kq150Initialized.current) {
+      kq150Initialized.current = true;
       fetchKQ150Init();
     }
   }, [productTab]);
 
   useEffect(() => {
-    if (isFirstKQ150.current) return;
     if (kq150SelectedExpiry) fetchKQ150Options(kq150SelectedExpiry);
-  }, [kq150SelectedExpiry]);
+  }, [kq150SelectedExpiry]);  // 최초 mount 시엔 kq150SelectedExpiry가 ''이므로 자동 skip
+
+  // KQ150 탭 10초 자동 갱신
+  useEffect(() => {
+    if (productTab !== 'KQ150' || !kq150SelectedExpiry) return;
+    const id = setInterval(() => fetchKQ150Options(kq150SelectedExpiry, false), REFRESH_MS);
+    return () => clearInterval(id);
+  }, [productTab, kq150SelectedExpiry, fetchKQ150Options]);
 
   const handleWeeklySelect = useCallback((optcode: string, strike: number, type: 'C' | 'P') => {
     if (!optcode) return;
     const label  = weeklyTabs.find(t => t.day === weekDay)?.label ?? weekDay;
     const yyyymm = weekDay === '월' ? 'W1 ' : 'W2 ';
-    navigation.navigate('FuturesOption', {
-      shcode: optcode,
-      hname:  `${type === 'C' ? 'C' : 'P'} ${label} ${fmt2(strike)}`,
-      yyyymm: yyyymm,
-    });
+    handleItemPress(optcode, `${type === 'C' ? 'C' : 'P'} ${label} ${fmt2(strike)}`, yyyymm);
   }, [navigation, weekDay, weeklyTabs]);
 
   const weekDayTabs = weeklyTabs;
@@ -589,7 +614,7 @@ const FuturesSearchScreen = () => {
           <TouchableOpacity style={s.cell} activeOpacity={0.7}
             onPress={() => isWeekly
               ? handleWeeklySelect(r.callOptcode, r.strike, 'C')
-              : navigation.navigate('FuturesOption', {shcode: r.callOptcode, hname: callHname, yyyymm: callYyyymm})}>
+              : handleItemPress(r.callOptcode, callHname, callYyyymm)}>
             <Text style={[s.priceText, {textAlign:'center', color: callChgColor}]}>{fmt2(r.call)}</Text>
           </TouchableOpacity>
           <View style={s.strikeCell}>
@@ -598,7 +623,7 @@ const FuturesSearchScreen = () => {
           <TouchableOpacity style={s.cell} activeOpacity={0.7}
             onPress={() => isWeekly
               ? handleWeeklySelect(r.putOptcode, r.strike, 'P')
-              : navigation.navigate('FuturesOption', {shcode: r.putOptcode, hname: putHname, yyyymm: putYyyymm})}>
+              : handleItemPress(r.putOptcode, putHname, putYyyymm)}>
             <Text style={[s.priceText, {textAlign:'center', color: putChgColor}]}>{fmt2(r.put)}</Text>
           </TouchableOpacity>
           <View style={s.cell}>
@@ -660,7 +685,7 @@ const FuturesSearchScreen = () => {
             <View style={s.monthRow}>
               {kp200Months.map(m => (
                 <TouchableOpacity key={m.shcode} activeOpacity={0.4} style={s.monthBtn}
-                  onPress={() => navigation.navigate('FuturesOption', {shcode: m.shcode, hname: m.label, yyyymm: m.yyyymm})}>
+                  onPress={() => handleItemPress(m.shcode, m.label, m.yyyymm)}>
                   <Text style={s.monthBtnText}>{m.label}</Text>
                 </TouchableOpacity>
               ))}
@@ -743,7 +768,7 @@ const FuturesSearchScreen = () => {
             <View style={s.monthRow}>
               {kq150Months.map(m => (
                 <TouchableOpacity key={m.shcode} activeOpacity={0.4} style={s.monthBtn}
-                  onPress={() => navigation.navigate('FuturesOption', {shcode: m.shcode, hname: m.label, yyyymm: m.yyyymm})}>
+                  onPress={() => handleItemPress(m.shcode, m.label, m.yyyymm)}>
                   <Text style={s.monthBtnText}>{m.label}</Text>
                 </TouchableOpacity>
               ))}

@@ -1,8 +1,19 @@
 const BASE_URL = 'https://openapi.ls-sec.co.kr:8080';
 
-const APP_KEY    = 'PS5MpALYPd9WNIiSOADkmTeWby7rSiAzDwZE';
-const APP_SECRET = 'YwssP1wAalH45eEx0LPQIaNhLn42tCCn';
+// 런타임에 로그인 화면에서 세팅됨
+let APP_KEY    = '';
+let APP_SECRET = '';
 let accessToken: string | null = null;
+
+// AsyncStorage 키 — LoginScreen과 동일하게 맞춤
+const SAVE_KEY = 'savedApiKeys';
+
+// 로그인 시 키 세팅 + 기존 토큰 초기화
+export const setApiKeys = (appKey: string, appSecret: string) => {
+  APP_KEY    = appKey;
+  APP_SECRET = appSecret;
+  accessToken = null;
+};
 
 export const getApiKeys = () => ({ appKey: APP_KEY, appSecret: APP_SECRET });
 
@@ -10,6 +21,22 @@ export const getApiKeys = () => ({ appKey: APP_KEY, appSecret: APP_SECRET });
 // 인증
 // ============================
 export const getAccessToken = async (): Promise<string> => {
+  // 키가 없으면 AsyncStorage에서 복원 시도 (앱 재시작 / 모듈 리로드 대응)
+  if (!APP_KEY || !APP_SECRET) {
+    try {
+      const {default: AsyncStorage} = await import('@react-native-async-storage/async-storage');
+      const val = await AsyncStorage.getItem(SAVE_KEY);
+      if (val) {
+        const {appKey, secretKey} = JSON.parse(val);
+        if (appKey && secretKey) {
+          APP_KEY    = appKey;
+          APP_SECRET = secretKey;
+        }
+      }
+    } catch {}
+  }
+  if (!APP_KEY || !APP_SECRET) throw new Error('앱 키와 시크릿 키를 먼저 입력해주세요.');
+
   const body = [
     'grant_type=client_credentials',
     `appkey=${encodeURIComponent(APP_KEY)}`,
@@ -22,6 +49,7 @@ export const getAccessToken = async (): Promise<string> => {
     body,
   });
   const data = await response.json();
+  console.log('🔑 토큰 발급 완료, APP_KEY 앞10자:', APP_KEY.slice(0, 10), '/ token 앞20자:', data.access_token?.slice(0, 20));
   if (!response.ok) throw new Error(data?.rsp_msg ?? '토큰 발급 실패');
   accessToken = data.access_token;
   return data.access_token;
@@ -46,7 +74,11 @@ const postApi = async (path: string, trCd: string, body: object) => {
     body: JSON.stringify(body),
   });
   const data = await response.json();
+  console.log(`📡 [${trCd}] 응답:`, JSON.stringify(data).slice(0, 300));
   if (!response.ok) throw new Error(data?.rsp_msg ?? `${trCd} 조회 실패`);
+  if (data?.rsp_cd && data.rsp_cd !== '00000' && data.rsp_cd !== '00200') {
+    console.log(`⚠️ [${trCd}] rsp_cd=${data.rsp_cd} rsp_msg=${data.rsp_msg}`);
+  }
   return data;
 };
 
@@ -129,37 +161,39 @@ export interface FuturesBalanceHolding {
 }
 
 export interface FuturesBalanceSummary {
-  acntNm:        string; // 계좌명
-  evalDpsamtTotamt: number; // 평가예탁금총액
-  futsEvalPnlAmt:   number; // 선물평가손익금액
-  optEvalPnlAmt:    number; // 옵션평가손익금액
-  totPnlAmt:        number; // 총손익금액
-  mnyOrdAbleAmt:    number; // 현금주문가능금액
+  acntNo:           string; // 계좌번호
+  acntNm:           string; // 계좌명
+  evalDpsamtTotamt: number;
+  futsEvalPnlAmt:   number;
+  optEvalPnlAmt:    number;
+  totPnlAmt:        number;
+  mnyOrdAbleAmt:    number;
 }
 
 export const getFuturesBalance = async (): Promise<{
   summary:  FuturesBalanceSummary;
   holdings: FuturesBalanceHolding[];
 }> => {
-  // 오늘 날짜 YYYYMMDD
   const today = new Date();
   const ordDt = `${today.getFullYear()}${String(today.getMonth()+1).padStart(2,'0')}${String(today.getDate()).padStart(2,'0')}`;
 
   const res = await postApi('/futureoption/accno', 'CFOAQ50600', {
     CFOAQ50600InBlock1: {
       RecCnt: 1, OrdDt: ordDt,
-      BalEvalTp: '2',       // 선입선출법 → HTS 기준과 동일
-      FutsPrcEvalTp: '2',   // 전일종가 기준
+      BalEvalTp: '2',
+      FutsPrcEvalTp: '2',
       LqtQtyQryTp: '1',
     },
   });
 
+  const b1 = res.CFOAQ50600OutBlock1 ?? {};
   const b2 = res.CFOAQ50600OutBlock2 ?? {};
   const b3 = Array.isArray(res.CFOAQ50600OutBlock3) ? res.CFOAQ50600OutBlock3 : [];
 
   return {
     summary: {
-      acntNm:           b2.AcntNm           ?? '',
+      acntNo:           String(b1.AcntNo          ?? ''),
+      acntNm:           String(b2.AcntNm           ?? ''),
       evalDpsamtTotamt: Number(b2.EvalDpsamtTotamt ?? 0),
       futsEvalPnlAmt:   Number(b2.FutsEvalPnlAmt   ?? 0),
       optEvalPnlAmt:    Number(b2.OptEvalPnlAmt     ?? 0),
@@ -167,18 +201,18 @@ export const getFuturesBalance = async (): Promise<{
       mnyOrdAbleAmt:    Number(b2.MnyOrdAbleAmt     ?? 0),
     },
     holdings: b3.map((r: any) => ({
-      fnoIsuNo:    String(r.FnoIsuNo  ?? ''),
-      isuNm:       String(r.IsuNm     ?? ''),
-      bnsTpNm:     String(r.BnsTpNm   ?? ''),
-      bnsTpCode:   String(r.BnsTpCode ?? ''),
-      unsttQty:    Number(r.UnsttQty  ?? 0),
-      lqdtAbleQty: Number(r.LqdtAbleQty ?? 0),
-      fnoAvrPrc:   Number(r.FnoAvrPrc ?? 0),
-      fnoNowPrc:   Number(r.FnoNowPrc ?? 0),
-      evalAmt:     Number(r.EvalAmt   ?? 0),
-      evalPnl:     Number(r.EvalPnl   ?? 0),
-      pnlRat:      Number(r.PnlRat    ?? 0),
-      bnsplAmt:    Number(r.BnsplAmt  ?? 0),
+      fnoIsuNo:    String(r.FnoIsuNo     ?? ''),
+      isuNm:       String(r.IsuNm        ?? ''),
+      bnsTpNm:     String(r.BnsTpNm      ?? ''),
+      bnsTpCode:   String(r.BnsTpCode    ?? ''),
+      unsttQty:    Number(r.UnsttQty     ?? 0),
+      lqdtAbleQty: Number(r.LqdtAbleQty  ?? 0),
+      fnoAvrPrc:   Number(r.FnoAvrPrc    ?? 0),
+      fnoNowPrc:   Number(r.FnoNowPrc    ?? 0),
+      evalAmt:     Number(r.EvalAmt      ?? 0),
+      evalPnl:     Number(r.EvalPnl      ?? 0),
+      pnlRat:      Number(r.PnlRat       ?? 0),
+      bnsplAmt:    Number(r.BnsplAmt     ?? 0),
     })),
   };
 };
@@ -194,6 +228,73 @@ export const getFuturesChart = async (
   return postApi('/futureoption/chart', 't8416', {
     t8416InBlock: { shcode, gubun, qrycnt, sdate, edate, cts_date, comp_yn: 'N' },
   });
+};
+
+// ============================
+// 코스피200 현물지수 분봉 샘플 조회 (디버그용)
+// t8416 1분봉에서 kospijisu 필드 확인
+// ============================
+export const debugKospi200MinuteSamples = async (
+  futCode: string,   // 선물 종목코드 (예: A0166000)
+  count: number = 10,
+): Promise<void> => {
+  try {
+    console.log(`\n🔍 [t8416 분봉 조회] futCode=${futCode}, count=${count}`);
+    const res = await postApi('/futureoption/chart', 't8416', {
+      t8416InBlock: {
+        shcode:   futCode,
+        gubun:    '2',       // 2 = 분봉
+        qrycnt:   count,
+        sdate:    '',
+        edate:    '99999999',
+        cts_date: '',
+        comp_yn:  'N',
+      },
+    });
+
+    // OutBlock 헤더 정보
+    const header = res.t8416OutBlock;
+    console.log('📋 OutBlock (헤더):', JSON.stringify(header));
+
+    // 봉 데이터
+    const bars = Array.isArray(res.t8416OutBlock1) ? res.t8416OutBlock1 : [];
+    console.log(`📊 봉 개수: ${bars.length}개`);
+
+    if (bars.length === 0) {
+      console.log('⚠️ 봉 데이터 없음');
+      return;
+    }
+
+    // 첫 번째 봉 전체 필드 출력 (어떤 필드가 있는지 확인)
+    console.log('🔎 첫 번째 봉 전체 필드:', JSON.stringify(bars[0]));
+
+    // 최신순으로 오는 데이터를 오래된 것부터 출력
+    const reversed = [...bars].reverse();
+    reversed.forEach((b: any, i: number) => {
+      console.log(
+        `[${i + 1}] time=${b.date ?? b.dtime ?? b.time ?? '?'} | ` +
+        `close=${b.close ?? b.price ?? '?'} | ` +
+        `kospijisu=${b.kospijisu ?? '없음'} | ` +
+        `jisu=${b.jisu ?? '없음'} | ` +
+        `open=${b.open ?? '?'} | ` +
+        `high=${b.high ?? '?'} | ` +
+        `low=${b.low ?? '?'}`,
+      );
+    });
+
+    // kospijisu 필드 존재 여부 최종 판단
+    const hasKospi = bars.some((b: any) => b.kospijisu !== undefined && Number(b.kospijisu) > 0);
+    console.log(`\n✅ kospijisu 필드 사용 가능: ${hasKospi ? 'YES ✓' : 'NO ✗'}`);
+    if (hasKospi) {
+      const values = reversed.map((b: any) => Number(b.kospijisu)).filter(v => v > 0);
+      const avg = (values.reduce((a, b) => a + b, 0) / values.length).toFixed(2);
+      console.log(`📈 코스피200 샘플값: [${values.map(v => v.toFixed(2)).join(', ')}]`);
+      console.log(`📊 평균: ${avg}`);
+    }
+
+  } catch (e: any) {
+    console.log('❌ debugKospi200MinuteSamples 오류:', e?.message);
+  }
 };
 
 // ============================
@@ -446,6 +547,38 @@ export const getPendingOrders = (expcode: string): Promise<FuturesOrderItem[]> =
   getFuturesOrders(expcode, '2', '1');
 
 // ============================
+// 선물옵션 계좌 주문체결내역 조회 (CFOAQ00600)
+// 계좌번호 + 계좌명 가져오는 용도로도 사용
+// ============================
+export interface FuturesAccountInfo {
+  acntNo: string;  // 계좌번호
+  acntNm: string;  // 계좌명
+}
+
+export const getFuturesAccountInfo = async (): Promise<FuturesAccountInfo> => {
+  const today = new Date();
+  const dt = `${today.getFullYear()}${String(today.getMonth()+1).padStart(2,'0')}${String(today.getDate()).padStart(2,'0')}`;
+  const res = await postApi('/futureoption/accno', 'CFOAQ00600', {
+    CFOAQ00600InBlock1: {
+      RecCnt:         1,
+      QrySrtDt:       dt,
+      QryEndDt:       dt,
+      FnoClssCode:    '00',
+      PrdgrpCode:     '00',
+      PrdtExecTpCode: '0',
+      StnlnSeqTp:     '3',
+      CommdaCode:     '99',
+    },
+  });
+  const b1 = res.CFOAQ00600OutBlock1 ?? {};
+  const b2 = res.CFOAQ00600OutBlock2 ?? {};
+  return {
+    acntNo: String(b1.AcntNo ?? ''),
+    acntNm: String(b2.AcntNm ?? ''),
+  };
+};
+
+// ============================
 // 선물옵션 취소주문 (CFOAT00300)
 // ============================
 export const cancelOrder = async (params: {
@@ -460,4 +593,49 @@ export const cancelOrder = async (params: {
       CancQty:  params.cancQty,
     },
   });
+};
+
+// ============================
+// 업종차트 N분 (t8418)
+// 코스피200 현물지수 분봉 조회
+// shcode: '101' = 코스피200, '001' = 코스피 종합
+// ncnt: 1 = 1분봉
+// ============================
+export interface KospiMinuteBar {
+  date:  string;  // "YYYYMMDD"
+  time:  string;  // "HHMMSS"
+  open:  number;
+  high:  number;
+  low:   number;
+  close: number;  // 코스피200 현물지수값
+}
+
+export const getKospi200MinuteBars = async (
+  count: number = 12,
+  shcode: string = '101',  // 101 = 코스피200
+): Promise<KospiMinuteBar[]> => {
+  const res = await postApi('/indtp/chart', 't8418', {
+    t8418InBlock: {
+      shcode,
+      ncnt:     1,
+      qrycnt:   count,
+      nday:     '0',
+      sdate:    ' ',
+      stime:    '',
+      edate:    '99999999',
+      etime:    '',
+      cts_date: ' ',
+      cts_time: '',
+      comp_yn:  'N',
+    },
+  });
+  const bars = Array.isArray(res.t8418OutBlock1) ? res.t8418OutBlock1 : [];
+  return bars.map((b: any) => ({
+    date:  String(b.date  ?? ''),
+    time:  String(b.time  ?? ''),
+    open:  Number(b.open  ?? 0),
+    high:  Number(b.high  ?? 0),
+    low:   Number(b.low   ?? 0),
+    close: Number(b.close ?? 0),
+  }));
 };

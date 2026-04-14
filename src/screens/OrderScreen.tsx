@@ -15,6 +15,8 @@ import {RootStackParamList} from '../navigation/RootNavigator';
 import {
   placeOrder, modifyOrder, cancelOrder, getPendingOrders, getFuturesOrders,
   getFuturesHoga, getFuturesPrice, getFuturesBalance, getWeeklyOptionBoard,
+  getFuturesChart, debugKospi200MinuteSamples, getKospi200MinuteBars,
+  getFuturesAccountInfo,
   FuturesOrderItem, FuturesBalanceHolding, FuturesBalanceSummary,
   OrderPriceType,
 } from '../api/lsApi';
@@ -47,7 +49,7 @@ const C = {
 };
 
 type OrderMode = '매수' | '매도' | '정정/취소' | '체결' | '잔고' | '자동화';
-type AutoSubTab = '추가' | '조회/수정';
+type AutoSubTab = '추가/수정' | '조회';
 
 // ── 자동화 상태 타입 ────────────────────────────────────────────────────────
 type AutoStatus = 'idle' | 'monitoring' | 'ordered' | 'done' | 'error';
@@ -177,10 +179,18 @@ const OrderScreen = () => {
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const [tab,                 setTab]                 = useState<OrderMode>(initMode);
+
+  const [acntNo,              setAcntNo]              = useState('');
+  const [acntNm,              setAcntNm]              = useState('');
+
+
   const [qty,                 setQty]                 = useState(0);
   const [px,                  setPx]                  = useState(initPrice);
   const [orderType,           setOrderType]           = useState<OrderPriceType>('00');
   const [submitting,          setSubmitting]          = useState(false);
+  const [ableQty,             setAbleQty]             = useState<number | null>(null);  // 가능(신규) 수량
+  const [closeQty,            setCloseQty]            = useState<number | null>(null);  // 청산 가능 수량
+  const [ableQtyLoading,      setAbleQtyLoading]      = useState(false);
   const [liveAsks,            setLiveAsks]            = useState(hoga?.asks ?? []);
   const [liveBids,            setLiveBids]            = useState(hoga?.bids ?? []);
   const [liveDvol,            setLiveDvol]            = useState(hoga?.dvol ?? 0);
@@ -208,15 +218,17 @@ const OrderScreen = () => {
   const hname = route.params.hname ?? '';
   const isOptionCode = /^[PC]\s/i.test(hname);
   const isFuturesCode = !isOptionCode;
-  const autoIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const autoConfigRef   = useRef<AutoConfig | null>(null);
-  const autoKospiRef    = useRef<number | null>(null);
-  const [autoSubTab,        setAutoSubTab]        = useState<AutoSubTab>(isFuturesCode ? '조회/수정' : '추가');
+  const autoIntervalRef  = useRef<ReturnType<typeof setInterval> | null>(null);
+  const autoConfigRef    = useRef<AutoConfig | null>(null);
+  const autoKospiRef     = useRef<number | null>(null);
+  const kospiSamplesRef  = useRef<number[]>([]);   // 코스피200 샘플 수집용
+  const [autoSubTab,        setAutoSubTab]        = useState<AutoSubTab>('추가/수정');
   const [autoStatus,        setAutoStatus]        = useState<AutoStatus>('idle');
   const [autoLog,           setAutoLog]           = useState<string[]>([]);
   const [autoKospi,         setAutoKospi]         = useState<number | null>(null);
   const [autoOptPrice,      setAutoOptPrice]      = useState<number | null>(null);
   const [autoFutPrice,      setAutoFutPrice]      = useState<number | null>(null);
+  const [kospiSampleCount,  setKospiSampleCount]  = useState(0);   // UI 표시용
   const [allSavedConfigs,   setAllSavedConfigs]   = useState<Record<string, AutoConfig>>({});
   const [bgRunning,         setBgRunning]         = useState(false);
 
@@ -255,11 +267,43 @@ const OrderScreen = () => {
     orderDeadline:     '15:35:00',
   });
 
+  // selectedOpt: FuturesSearchScreen에서 선택된 종목 반영
+  useEffect(() => {
+    const params = route.params as any;
+    if (params?.selectedOpt) {
+      const { shcode: optShcode, hname: optHname } = params.selectedOpt;
+      const strikeMatch = optHname.match(/([\d.]+)\s*$/);
+      const strike = strikeMatch ? Number(strikeMatch[1]) : autoConfig.putStrike;
+      setAutoConfig(c => ({
+        ...c,
+        putOptCode:  optShcode,
+        putOptHname: optHname,
+        putStrike:   strike,
+      }));
+      setTab('자동화');
+      setAutoSubTab('추가/수정');
+    }
+  }, [(route.params as any)?.selectedOpt]);
+
   const addLog = (msg: string) => {
     const now = new Date();
     const kst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
     const ts  = `${String(kst.getUTCHours()).padStart(2,'0')}:${String(kst.getUTCMinutes()).padStart(2,'0')}:${String(kst.getUTCSeconds()).padStart(2,'0')}`;
     setAutoLog(prev => [`[${ts}] ${msg}`, ...prev].slice(0, 100));
+  };
+
+  // foreground에서 실행된 결과를 AsyncStorage에 저장 → RootNavigator가 복귀 시 Alert
+  const RESULT_KEY = 'autoResults';
+  const saveResult = async (type: string, message: string, detail: string) => {
+    try {
+      const now = new Date();
+      const kst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+      const ts  = `${String(kst.getUTCHours()).padStart(2,'0')}:${String(kst.getUTCMinutes()).padStart(2,'0')}:${String(kst.getUTCSeconds()).padStart(2,'0')}`;
+      const raw = await AsyncStorage.getItem(RESULT_KEY);
+      const list = raw ? JSON.parse(raw) : [];
+      list.unshift({type, ts, message, detail});
+      await AsyncStorage.setItem(RESULT_KEY, JSON.stringify(list.slice(0, 50)));
+    } catch {}
   };
 
   // ── 자동화 설정 저장/불러오기 (AsyncStorage) ──────────────────────────────
@@ -394,6 +438,12 @@ const OrderScreen = () => {
       await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(all));
       setAllSavedConfigs({...all});
       console.log('🗑 자동화 삭제:', optCode);
+
+      // 남은 설정 없으면 백그라운드 서비스도 자동 중지
+      if (Object.keys(all).length === 0 && isBackgroundServiceRunning()) {
+        console.log('🛑 자동화 전체 완료 — 백그라운드 서비스 중지');
+        stopBackgroundService().then(() => setBgRunning(false)).catch(() => {});
+      }
     } catch (e) {
       console.log('❌ 자동화 삭제 실패:', e);
     }
@@ -414,6 +464,8 @@ const OrderScreen = () => {
     setAutoKospi(null);
     setAutoOptPrice(null);
     setAutoFutPrice(null);
+    kospiSamplesRef.current = [];
+    setKospiSampleCount(0);
     addLog('자동화 모니터링 시작');
     addLog(`풋옵션 코드: ${autoConfig.putOptCode} / 행사가: ${autoConfig.putStrike}`);
     addLog(`선물 자동 매수: ${autoConfig.futuresCode}`);
@@ -426,27 +478,151 @@ const OrderScreen = () => {
         .catch(e => console.log('❌ BG 시작 실패:', e?.message));
     }
 
+    // ── 시간 문자열 → 분 변환 헬퍼 ──────────────────────────────────────────
+    const toMinutes = (hhmm: string): number => {
+      const [h, m] = hhmm.split(':').map(Number);
+      return h * 60 + m;
+    };
+
+    // ── 등록 시점에 t8418로 코스피200 현물지수 분봉 소급 수집 ─────────────────
+    const backfillSamples = async () => {
+      const nowStr      = nowHHMMSS();
+      const nowMin      = toMinutes(nowStr.slice(0, 5));
+      const deadlineMin = toMinutes(autoConfig.orderDeadline.slice(0, 5));
+      const sampleStart = deadlineMin - 10;
+      const missedCount = Math.max(0, nowMin - sampleStart);
+
+      console.log(`🔧 [소급] now=${nowStr} | sampleStart=${String(Math.floor(sampleStart/60)).padStart(2,'0')}:${String(sampleStart%60).padStart(2,'0')} | missedCount=${missedCount}`);
+
+      if (missedCount <= 0) {
+        const sHH = String(Math.floor(sampleStart / 60)).padStart(2, '0');
+        const sMM = String(sampleStart % 60).padStart(2, '0');
+        const msg = `📊 소급 불필요 — 수집 구간 ${sHH}:${sMM} 아직 시작 안 됨`;
+        console.log(msg); addLog(msg);
+        return;
+      }
+
+      const fetchCount = Math.min(missedCount, 10);
+      const msg0 = `🔍 코스피200 분봉 소급 조회 (t8418) — ${fetchCount}개 필요`;
+      console.log(msg0); addLog(msg0);
+
+      try {
+        // t8418: 코스피200 업종코드 (테스트 버튼으로 확인한 코드 사용)
+        const bars = await getKospi200MinuteBars(fetchCount + 3, '101');
+
+        console.log(`📡 t8418 응답 — ${bars.length}개 봉`);
+        addLog(`📡 t8418 응답 — ${bars.length}개 봉`);
+
+        if (bars.length === 0) {
+          const msg = '⚠️ t8418 데이터 없음 — 실시간 수집만 사용';
+          console.log(msg); addLog(msg);
+          return;
+        }
+
+        console.log(`🔎 첫 봉: date=${bars[0].date} time=${bars[0].time} close=${bars[0].close}`);
+
+        // API는 최신순으로 오므로 시간 오름차순으로 정렬 (과거→최신)
+        const sorted = [...bars].sort((a, b) => {
+          const toMin = (t: string) => parseInt(t.slice(0,2),10)*60 + parseInt(t.slice(2,4),10);
+          return toMin(a.time) - toMin(b.time);
+        });
+        const backfilled: { min: number; val: number }[] = [];
+
+        sorted.forEach((b) => {
+          // time 필드: "HHMMSS" (6자리)
+          const t = b.time;
+          if (t.length < 6) return;
+          const hh = parseInt(t.slice(0, 2), 10);
+          const mm = parseInt(t.slice(2, 4), 10);
+          const ss = parseInt(t.slice(4, 6), 10);
+          const barMin = hh * 60 + mm;
+          const timeDisplay = `${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}:${String(ss).padStart(2,'0')}`;
+          const kospiVal = b.close; // 업종 종가 = 코스피200 현물지수
+
+          if (barMin >= sampleStart && barMin < nowMin && kospiVal > 0) {
+            backfilled.push({ min: barMin, val: kospiVal });
+            const msg = `📈 소급 [${backfilled.length}/${fetchCount}] | ${timeDisplay} | 코스피200: ${kospiVal.toFixed(2)}`;
+            console.log(msg); addLog(msg);
+          } else {
+            console.log(`⏭ 스킵 | ${timeDisplay} | barMin=${barMin}(범위:${sampleStart}~${deadlineMin}) | close=${kospiVal}`);
+          }
+        });
+
+        if (backfilled.length > 0) {
+          const vals = backfilled.map(x => x.val);
+          kospiSamplesRef.current = vals;
+          setKospiSampleCount(vals.length);
+          const avg = (vals.reduce((a, b) => a + b, 0) / vals.length).toFixed(2);
+          const listStr = backfilled
+            .map(x => `${String(Math.floor(x.min/60)).padStart(2,'0')}:${String(x.min%60).padStart(2,'0')}→${x.val.toFixed(2)}`)
+            .join(' / ');
+          console.log(`✅ 소급 완료 — ${vals.length}개`);
+          console.log(`📋 소급 샘플 목록: [${listStr}]`);
+          console.log(`📊 현재 평균: ${avg} / 앞으로 ${10 - vals.length}개 실시간 수집 예정`);
+          addLog(`✅ 소급 완료 — ${vals.length}개`);
+          addLog(`📋 소급 샘플 목록: [${listStr}]`);
+          addLog(`📊 현재 평균: ${avg} / 앞으로 ${10 - vals.length}개 실시간 수집 예정`);
+        } else {
+          const msg = '⚠️ 소급 범위 내 데이터 없음 — 실시간 수집만 사용';
+          console.log(msg); addLog(msg);
+        }
+      } catch (e: any) {
+        console.log(`❌ t8418 소급 실패: ${e?.message}`);
+        addLog(`❌ t8418 소급 실패: ${e?.message}`);
+      }
+    };
+
+    backfillSamples();
+
     autoIntervalRef.current = setInterval(async () => {
       const now = nowHHMMSS();
-      const cfg = autoConfigRef.current ?? autoConfig;  // null 안전
+      const cfg = autoConfigRef.current ?? autoConfig;
 
+      // ── 마감 시각 도달 ────────────────────────────────────────────────────
       if (now >= cfg.orderDeadline) {
         addLog(`⏰ 주문 마감 시각 ${cfg.orderDeadline} 도달`);
         if (autoIntervalRef.current) { clearInterval(autoIntervalRef.current); autoIntervalRef.current = null; }
 
-        // 마감 시점에 코스피200 최신값 조회 후 조건 판단
         try {
           const futCode   = cfg.futuresCode || (shcode ?? 'A0166000');
           const priceData = await getFuturesPrice(futCode);
-          const kospi200  = priceData.kospijisu;
           const futPrice  = priceData.price;
+          setAutoFutPrice(futPrice);
+
+          // ── 코스피200 결정: 샘플 평균 or 현재값 폴백 ──────────────────────
+          let kospi200: number;
+          const samples = kospiSamplesRef.current;
+          if (samples.length > 0) {
+            kospi200 = +(samples.reduce((a, b) => a + b, 0) / samples.length).toFixed(2);
+            // 샘플 목록 상세 로그
+            const sampleList = samples
+              .map((v, i) => {
+                const deadlineMin2 = toMinutes(cfg.orderDeadline.slice(0, 5));
+                const sampleStart2 = deadlineMin2 - 10;
+                const m = sampleStart2 + i;
+                const h = String(Math.floor(m / 60)).padStart(2, '0');
+                const mm2 = String(m % 60).padStart(2, '0');
+                return `${h}:${mm2}→${v.toFixed(2)}`;
+              })
+              .join(' / ');
+            addLog(`📊 샘플 목록 [${samples.length}개]: ${sampleList}`);
+            addLog(`📊 코스피200 평균 (${samples.length}개 샘플): ${kospi200.toFixed(2)}`);
+          } else {
+            // 샘플 없을 때 t8418 최신값으로 폴백
+            try {
+              const fallbackBars = await getKospi200MinuteBars(2, '101');
+              kospi200 = fallbackBars[0]?.close ?? priceData.kospijisu;
+            } catch {
+              kospi200 = priceData.kospijisu;
+            }
+            addLog(`📊 코스피200 현재값 사용 (샘플 없음, t8418): ${kospi200.toFixed(2)}`);
+          }
+
           setAutoKospi(kospi200);
           autoKospiRef.current = kospi200;
-          setAutoFutPrice(futPrice);
-          addLog(`마감 시점 코스피200: ${kospi200.toFixed(2)} / 행사가: ${cfg.putStrike}`);
+          addLog(`마감 코스피200: ${kospi200.toFixed(2)} / 행사가: ${cfg.putStrike}`);
 
           if (kospi200 < cfg.putStrike) {
-            // 코스피 < 행사가 → 선물 매수
             addLog(`⚠️ 선물 매수 조건 충족! 코스피 ${kospi200.toFixed(2)} < 행사가 ${cfg.putStrike}`);
             addLog(`선물 매수 주문 — ${cfg.futuresCode} ${cfg.futuresQty}계약 @ ${(futPrice + 0.5).toFixed(2)}`);
             setAutoStatus('ordered');
@@ -462,9 +638,24 @@ const OrderScreen = () => {
               addLog(`✅ 선물 매수 완료 — 주문번호: ${b2?.OrdNo ?? '-'} / ${b2?.IsuNm ?? '-'}`);
               setAutoStatus('done');
               deleteAutoConfig(cfg.putOptCode);
+              const sampleDetail = samples.length > 0
+                ? `\n\n[코스피200 샘플 ${samples.length}개]\n` + samples.map((v, i) => {
+                    const deadlineMin2 = toMinutes(cfg.orderDeadline.slice(0, 5));
+                    const m = (deadlineMin2 - 10) + i;
+                    return `${String(Math.floor(m/60)).padStart(2,'0')}:${String(m%60).padStart(2,'0')} → ${v.toFixed(2)}`;
+                  }).join('\n') + `\n평균: ${kospi200.toFixed(2)}`
+                : `\n코스피200: ${kospi200.toFixed(2)} (실시간 단일값)`;
+              await saveResult(
+                'futures_buy',
+                '✅ 선물 자동 매수 완료',
+                `종목: ${b2?.IsuNm ?? cfg.futuresCode}\n주문번호: ${b2?.OrdNo ?? '-'}\n수량: ${cfg.futuresQty}계약\n가격: ${(futPrice + 0.5).toFixed(2)}${sampleDetail}`,
+              );
+              const alertKospiInfo = samples.length > 0
+                ? `\n코스피200 평균: ${kospi200.toFixed(2)} (${samples.length}개 샘플)`
+                : `\n코스피200: ${kospi200.toFixed(2)} (현재값)`;
               Alert.alert(
                 '✅ 선물 매수 완료',
-                `종목: ${b2?.IsuNm ?? cfg.futuresCode}\n주문번호: ${b2?.OrdNo ?? '-'}\n수량: ${cfg.futuresQty}계약\n가격: ${(futPrice + 0.5).toFixed(2)}`,
+                `종목: ${b2?.IsuNm ?? cfg.futuresCode}\n주문번호: ${b2?.OrdNo ?? '-'}\n수량: ${cfg.futuresQty}계약\n가격: ${(futPrice + 0.5).toFixed(2)}${alertKospiInfo}`,
                 [{text: '확인'}],
               );
             } catch (e: any) {
@@ -472,17 +663,27 @@ const OrderScreen = () => {
               setAutoStatus('error');
             }
           } else {
-            // 코스피 >= 행사가 → 다음 위클리 탐색
             addLog(`📋 코스피(${kospi200.toFixed(2)}) >= 행사가(${cfg.putStrike}) — 다음 위클리 탐색 시작`);
             const currentHname = cfg.putOptHname || route.params.hname || '';
-            addLog(`🔍 현재 hname: "${currentHname}" / 행사가: ${cfg.putStrike}`);
-            findNextWeeklyPutCode(currentHname, cfg.putStrike).then(result => {
+            findNextWeeklyPutCode(currentHname, cfg.putStrike).then(async result => {
               if (result) {
                 setAutoConfig(prev => ({...prev, putOptCode: result.optcode, putOptHname: result.nextHname}));
                 addLog(`🔄 다음 위클리 종목코드 자동 변경: ${result.optcode}`);
+                const sampleDetail2 = samples.length > 0
+                  ? `\n\n[코스피200 샘플 ${samples.length}개]\n` + samples.map((v, i) => {
+                      const deadlineMin2 = toMinutes(cfg.orderDeadline.slice(0, 5));
+                      const m = (deadlineMin2 - 10) + i;
+                      return `${String(Math.floor(m/60)).padStart(2,'0')}:${String(m%60).padStart(2,'0')} → ${v.toFixed(2)}`;
+                    }).join('\n') + `\n평균: ${kospi200.toFixed(2)}`
+                  : '';
+                await saveResult(
+                  'next_weekly',
+                  '📋 다음 위클리 풋매도 진입 필요',
+                  `코스피200 현물(${kospi200.toFixed(2)})이 행사가(${cfg.putStrike})보다 높습니다.\n\n현재 풋옵션은 안전하게 만기 소멸됩니다.\n다음 위클리 풋옵션으로 매도 진입하세요.${sampleDetail2}`,
+                );
                 Alert.alert(
-                  '다음 위클리 재진입',
-                  `코스피(${kospi200.toFixed(2)})가 행사가(${cfg.putStrike})보다 높습니다.\n\n다음 위클리 풋옵션:\n${result.optcode}\n\n추가 탭에서 확인 후 재등록하세요.`,
+                  '📋 다음 위클리 풋매도 진입 필요',
+                  `코스피200 현물 ${kospi200.toFixed(2)}\n행사가 ${cfg.putStrike}\n\n현물가격이 행사가보다 높으므로\n다음 위클리 풋옵션으로 매도하세요.`,
                   [{text: '확인'}],
                 );
               } else {
@@ -505,7 +706,6 @@ const OrderScreen = () => {
       }
 
       try {
-        // ① 선물 현재가 + 코스피200 현물지수 (t2101)
         const futCode   = cfg.futuresCode || (shcode ?? 'A0166000');
         const priceData = await getFuturesPrice(futCode);
         const kospi200  = priceData.kospijisu;
@@ -514,14 +714,84 @@ const OrderScreen = () => {
         autoKospiRef.current = kospi200;
         setAutoFutPrice(futPrice);
 
-        // ② 풋옵션 현재가 (t2105)
+        // ── 코스피200 샘플 수집 (deadline 10분 전부터 1분 간격) ──────────────
+        const nowMin      = toMinutes(now.slice(0, 5));          // "HH:MM"
+        const deadlineMin = toMinutes(cfg.orderDeadline.slice(0, 5));
+        const sampleStart = deadlineMin - 10;                    // deadline - 10분
+        const nowSec      = parseInt(now.slice(6, 8), 10);       // 초
+
+        // 수집 구간 진입 전 — 몇 분 후 시작인지 안내 (1분마다 1회)
+        if (nowMin < sampleStart && nowSec < 15) {
+          const remainMin = sampleStart - nowMin;
+          const sampleStartHH = String(Math.floor(sampleStart / 60)).padStart(2, '0');
+          const sampleStartMM = String(sampleStart % 60).padStart(2, '0');
+          addLog(`⏳ 샘플 수집 대기 중 — ${sampleStartHH}:${sampleStartMM} 부터 시작 (${remainMin}분 후) / 현재: ${now.slice(0,5)}`);
+        }
+
+        // 수집 구간 진입 — 1분 간격 체크 (매 정각 15초 이내에서만 수집)
+        if (nowMin >= sampleStart && nowMin < deadlineMin && nowSec < 15) {
+          const alreadyCount  = kospiSamplesRef.current.length;
+          const expectedCount = nowMin - sampleStart; // 이 시점에 있어야 할 샘플 수
+          const slotHH = String(Math.floor(nowMin / 60)).padStart(2, '0');
+          const slotMM = String(nowMin % 60).padStart(2, '0');
+
+          if (alreadyCount < expectedCount) {  // 소급으로 채워진 슬롯 중복 방지
+            // t8418로 현재 분의 코스피200 현물지수 조회 (t2101과 통일)
+            try {
+              const realtimeBars = await getKospi200MinuteBars(2, '101');
+              const latestBar = realtimeBars[0]; // 가장 최신 봉
+              const kospi200Realtime = latestBar ? latestBar.close : kospi200;
+              kospiSamplesRef.current.push(kospi200Realtime);
+              setKospiSampleCount(kospiSamplesRef.current.length);
+              const remaining = 10 - kospiSamplesRef.current.length;
+              addLog(
+                `📈 샘플 수집 [${kospiSamplesRef.current.length}/10]` +
+                ` | 시각: ${slotHH}:${slotMM}:${String(nowSec).padStart(2,'0')}` +
+                ` | 코스피200: ${kospi200Realtime.toFixed(2)}` +
+                ` | 남은 샘플: ${remaining}개` +
+                ` | 마감까지: ${deadlineMin - nowMin}분`,
+              );
+            } catch {
+              // t8418 실패 시 t2101 kospijisu 폴백
+              kospiSamplesRef.current.push(kospi200);
+              setKospiSampleCount(kospiSamplesRef.current.length);
+              addLog(`📈 샘플 수집 [${kospiSamplesRef.current.length}/10] | ${slotHH}:${slotMM} | 코스피200: ${kospi200.toFixed(2)} (폴백)`);
+            }
+            // 전체 샘플 목록 출력
+            const sampleList = kospiSamplesRef.current
+              .map((v, i) => {
+                const m = sampleStart + i;
+                const h = String(Math.floor(m / 60)).padStart(2, '0');
+                const mm2 = String(m % 60).padStart(2, '0');
+                return `${h}:${mm2}→${v.toFixed(2)}`;
+              })
+              .join(' / ');
+            addLog(`📋 누적 샘플: [${sampleList}]`);
+          } else {
+            addLog(
+              `⏭ ${slotHH}:${slotMM} 슬롯 이미 수집됨 (alreadyCount=${alreadyCount}, expected=${expectedCount})`,
+            );
+          }
+        }
+
+        // 수집 구간 내인데 정각이 아닐 때 — 다음 수집까지 몇 초 남았는지
+        if (nowMin >= sampleStart && nowMin < deadlineMin && nowSec >= 15) {
+          const nextSec = 60 - nowSec;
+          addLog(
+            `🕐 샘플 수집 구간 진행 중 [${kospiSamplesRef.current.length}/10]` +
+            ` | 현재: ${now.slice(0,8)}` +
+            ` | 다음 수집까지 약 ${nextSec}초`,
+          );
+        }
+
+        // ② 풋옵션 현재가
         const optHoga  = await getFuturesHoga(cfg.putOptCode);
         const optPrice = optHoga.price;
         setAutoOptPrice(optPrice);
 
-        addLog(`코스피200: ${kospi200.toFixed(2)} | 풋옵션: ${optPrice.toFixed(2)}P | 선물: ${futPrice.toFixed(2)}`);
+        addLog(`코스피200: ${kospi200.toFixed(2)} | 풋옵션: ${optPrice.toFixed(2)}P | 선물: ${futPrice.toFixed(2)}${kospiSamplesRef.current.length > 0 ? ` | 샘플 ${kospiSamplesRef.current.length}/10` : ''}`);
 
-        // ③ 청산 예약: 옵션가 <= 기준가 → 풋옵션 자동 청산
+        // ③ 청산 예약
         if (cfg.exitEnabled && optPrice <= cfg.exitThreshold) {
           addLog(`⚠️ 청산 조건 충족! 풋옵션가 ${optPrice.toFixed(2)} ≤ ${cfg.exitThreshold.toFixed(2)}`);
           addLog(`풋옵션 청산 주문 — ${cfg.putOptCode} 매수 @ 시장가`);
@@ -532,8 +802,8 @@ const OrderScreen = () => {
           try {
             const res = await placeOrder({
               fnoIsuNo:  cfg.putOptCode,
-              bnsTpCode: '1',   // 매도 청산 (풋매도 포지션 청산)
-              orderType: '03',  // 시장가
+              bnsTpCode: '1',
+              orderType: '03',
               price:     0,
               qty:       1,
             });
@@ -541,6 +811,11 @@ const OrderScreen = () => {
             addLog(`✅ 풋옵션 청산 완료 — 주문번호: ${b2?.OrdNo ?? '-'}`);
             setAutoStatus('done');
             deleteAutoConfig(cfg.putOptCode);
+            await saveResult(
+              'exit',
+              '✅ 풋옵션 자동 청산 완료',
+              `종목: ${cfg.putOptCode}\n주문번호: ${b2?.OrdNo ?? '-'}\n청산가: ${optPrice.toFixed(2)}P\n(기준가: ${cfg.exitThreshold.toFixed(2)}P 이하 도달)`,
+            );
             Alert.alert(
               '✅ 풋옵션 청산 완료',
               `종목: ${cfg.putOptCode}\n주문번호: ${b2?.OrdNo ?? '-'}\n청산가: ${optPrice.toFixed(2)}P\n(기준가: ${cfg.exitThreshold.toFixed(2)}P 이하 도달)`,
@@ -550,7 +825,7 @@ const OrderScreen = () => {
             addLog(`❌ 풋옵션 청산 실패: ${e?.message ?? '알 수 없는 오류'}`);
             setAutoStatus('error');
           }
-          return; // 청산 후 종료
+          return;
         }
 
       } catch (e: any) {
@@ -559,8 +834,25 @@ const OrderScreen = () => {
     }, 10000);
   };
 
-  // ── 호가 갱신 ──────────────────────────────────────────────────────────────
+  // ── 계좌 정보 — 다른 초기 API와 충돌 방지를 위해 3초 딜레이 후 조회 ──────
   useEffect(() => {
+    const timer = setTimeout(() => {
+      getFuturesAccountInfo()
+        .then(info => {
+          if (info.acntNo) setAcntNo(info.acntNo);
+          if (info.acntNm) setAcntNm(info.acntNm);
+        })
+        .catch(e => console.log('❌ 계좌 조회 실패:', e?.message));
+    }, 3000);
+    return () => clearTimeout(timer);
+  }, []);
+
+  // ── 호가 갱신 (체결 탭에서는 API 충돌 방지를 위해 중단) ────────────────────
+  useEffect(() => {
+    if (tab === '체결') {
+      if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
+      return;
+    }
     const fetchHoga = async () => {
       try {
         const data = await getFuturesHoga(shcode ?? 'A0166000');
@@ -571,7 +863,7 @@ const OrderScreen = () => {
     fetchHoga();
     intervalRef.current = setInterval(fetchHoga, 5000);
     return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
-  }, []);
+  }, [tab]);
 
   // ── 잔고 탭 ──────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -583,16 +875,45 @@ const OrderScreen = () => {
       .finally(() => setHoldingLoading(false));
   }, [tab]);
 
+  // ── 매수/매도 탭 진입 시 가능/청산 수량 조회 ─────────────────────────────
+  useEffect(() => {
+    if (tab !== '매수' && tab !== '매도') return;
+    setAbleQtyLoading(true);
+    getFuturesBalance()
+      .then(({summary, holdings: h}) => {
+        // 현재 종목 보유 포지션 찾기
+        const holding = h.find(item => item.fnoIsuNo === shcode);
+        // 청산 가능 수량: 보유 중인 경우만 (매수 탭이면 매도 보유, 매도 탭이면 매수 보유)
+        const myHolding = h.find(item =>
+          item.fnoIsuNo === shcode &&
+          (tab === '매수' ? item.bnsTpCode === '1' : item.bnsTpCode === '2'),
+        );
+        setCloseQty(myHolding ? myHolding.lqdtAbleQty : 0);
+        // 신규(가능) 수량: 현재가 기준 증거금으로 몇 계약 가능한지 추정
+        // mnyOrdAbleAmt / (현재가 * 250000 * 증거금율 약 10%) 로 추정
+        const marginPerContract = initPrice * 250000 * 0.1;
+        const estimatedAble = marginPerContract > 0
+          ? Math.floor(summary.mnyOrdAbleAmt / marginPerContract)
+          : 0;
+        setAbleQty(estimatedAble);
+      })
+      .catch(() => { setAbleQty(null); setCloseQty(null); })
+      .finally(() => setAbleQtyLoading(false));
+  }, [tab]);
+
   // ── 정정/취소 탭 진입 시 자동 조회 ───────────────────────────────────────
   useEffect(() => {
     if (tab !== '정정/취소') return;
     fetchPendingOrders();
   }, [tab]);
 
-  // ── 체결 탭 ───────────────────────────────────────────────────────────────
+  // ── 체결 탭 (호가 인터벌과 겹치지 않도록 1.5초 딜레이 후 조회) ─────────────
   useEffect(() => {
     if (tab !== '체결') return;
-    fetchOrderHistory(historyFilter);
+    const timer = setTimeout(() => {
+      fetchOrderHistory(historyFilter);
+    }, 1500);
+    return () => clearTimeout(timer);
   }, [tab]);
 
   const fetchPendingOrders = async () => {
@@ -616,9 +937,9 @@ const OrderScreen = () => {
     try {
       let list: FuturesOrderItem[];
       if (filter === '0') {
-        // 전체 = 미체결(전종목) + 체결(현재종목) 합치기
+        // 전체 = 미체결 + 체결 — API 2번 호출이므로 충분한 간격 확보
         const micheList = await getFuturesOrders('', '2', '1');
-        await new Promise<void>(r => setTimeout(r, 500));
+        await new Promise<void>(r => setTimeout(r, 2000));
         const cheolList = await getFuturesOrders('', '1', '1');
         const merged = [...micheList, ...cheolList];
         const seen = new Set<number>();
@@ -628,10 +949,12 @@ const OrderScreen = () => {
           return true;
         }).sort((a, b) => b.ordno - a.ordno);
       } else if (filter === '2') {
-        // 미체결 — 전 종목
+        // 미체결 — 호가 인터벌과 겹치지 않도록 딜레이 후 조회
+        await new Promise<void>(r => setTimeout(r, 1500));
         list = await getFuturesOrders('', '2', '1');
       } else {
-        // 체결 — 전 종목
+        // 체결 — 호가 인터벌과 겹치지 않도록 딜레이 후 조회
+        await new Promise<void>(r => setTimeout(r, 1500));
         list = await getFuturesOrders('', '1', '1');
       }
       setOrderHistory(list);
@@ -747,7 +1070,7 @@ const OrderScreen = () => {
               Alert.alert(
                 res.rsp_msg ?? '주문 완료',
                 `종목명: ${b2?.IsuNm ?? '-'}\n주문번호: ${b2?.OrdNo ?? '-'}\n주문가능수량: ${b2?.OrdAbleQty ?? '-'}계약`,
-                [{text: '확인', onPress: () => navigation.goBack()}],
+                [{text: '확인'}],
               );
             } catch (e: any) {
               Alert.alert('주문 실패', e?.message ?? '주문에 실패했습니다.');
@@ -818,7 +1141,11 @@ const OrderScreen = () => {
 
       {/* ── 계좌 바 ── */}
       <View style={s.acctBar}>
-        <Text style={s.acctText}>555035393-51 [선물옵션] [파생이수]jookinho</Text>
+        <Text style={s.acctText}>
+          {acntNo
+            ? `${acntNo.slice(0, 9)}-${acntNo.slice(9)} [선물옵션]${acntNm ? ` ${acntNm}` : ''}`
+            : '계좌 조회 중...'}
+        </Text>
         <View style={{flexDirection:'row', alignItems:'center', gap:8}}>
           <Text style={{color:C.navy, fontWeight:'600', fontSize:12}}>예약</Text>
           <Text style={{fontSize:14}}>🔒</Text>
@@ -1163,26 +1490,24 @@ const OrderScreen = () => {
         {tab === '자동화' && (
           <View style={{flex:1}}>
 
-            {/* ── 서브탭: 선물이면 조회/수정만 / 옵션이면 추가 + 조회/수정 ── */}
+            {/* ── 서브탭: 추가/수정 + 조회 ── */}
             <View style={as.subTabRow}>
-              {!isFuturesCode && (
-                <TouchableOpacity
-                  onPress={() => setAutoSubTab('추가')}
-                  style={[as.subTabBtn, autoSubTab === '추가' && as.subTabBtnActive]}>
-                  <Text style={[as.subTabText, autoSubTab === '추가' && as.subTabTextActive]}>추가</Text>
-                </TouchableOpacity>
-              )}
               <TouchableOpacity
-                onPress={() => setAutoSubTab('조회/수정')}
-                style={[as.subTabBtn, autoSubTab === '조회/수정' && as.subTabBtnActive]}>
-                <Text style={[as.subTabText, autoSubTab === '조회/수정' && as.subTabTextActive]}>조회/수정</Text>
+                onPress={() => setAutoSubTab('추가/수정')}
+                style={[as.subTabBtn, autoSubTab === '추가/수정' && as.subTabBtnActive]}>
+                <Text style={[as.subTabText, autoSubTab === '추가/수정' && as.subTabTextActive]}>추가/수정</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() => setAutoSubTab('조회')}
+                style={[as.subTabBtn, autoSubTab === '조회' && as.subTabBtnActive]}>
+                <Text style={[as.subTabText, autoSubTab === '조회' && as.subTabTextActive]}>조회</Text>
               </TouchableOpacity>
             </View>
 
             {/* ══════════════════════════════════════════════
                 서브탭: 추가 (풋옵션 종목에서만)
             ══════════════════════════════════════════════ */}
-            {autoSubTab === '추가' && !isFuturesCode && (
+            {autoSubTab === '추가/수정' && (
               <ScrollView style={{flex:1}} contentContainerStyle={{padding:12, gap:12}}>
 
                 {/* ══ 섹션 1: 풋옵션 매도 설정 ══ */}
@@ -1196,24 +1521,49 @@ const OrderScreen = () => {
                   {/* 풋옵션 종목코드 */}
                   <View style={as.tlRow}>
                     <Text style={as.tlLabel}>종목코드</Text>
-                    <View style={as.summaryCodeBox}>
-                      <Text style={as.summaryCode}>{autoConfig.putOptCode || (shcode ?? '-')}</Text>
-                    </View>
-                    <Text style={as.tlMeta}>현재 종목 자동 입력</Text>
+                    {isFuturesCode ? (
+                      <View style={{flex:1, flexDirection:'row', gap:6}}>
+                        <TextInput
+                          style={[as.textInput, {flex:1}]}
+                          value={autoConfig.putOptCode}
+                          onChangeText={v => setAutoConfig(c => ({...c, putOptCode: v.trim().toUpperCase()}))}
+                          placeholder="예) C09EW922"
+                          placeholderTextColor={C.dimText}
+                          autoCapitalize="characters"
+                          editable={autoStatus !== 'monitoring'}
+                        />
+                        <TouchableOpacity
+                          style={{
+                            paddingHorizontal: 12,
+                            paddingVertical: 9,
+                            borderRadius: 8,
+                            borderWidth: 1,
+                            borderColor: C.navy,
+                            backgroundColor: '#EEF2FF',
+                            justifyContent: 'center',
+                          }}
+                          disabled={autoStatus === 'monitoring'}
+                          onPress={() => navigation.navigate('FuturesSearch', {selectMode: true} as any)}>
+                          <Text style={{fontSize: 12, color: C.navy, fontWeight: '700'}}>🔍 검색</Text>
+                        </TouchableOpacity>
+                      </View>
+                    ) : (
+                      <>
+                        <View style={as.summaryCodeBox}>
+                          <Text style={as.summaryCode}>{autoConfig.putOptCode || (shcode ?? '-')}</Text>
+                        </View>
+                        <Text style={as.tlMeta}>현재 종목 자동 입력</Text>
+                      </>
+                    )}
                   </View>
 
                   {/* 행사가 */}
                   <View style={as.tlRow}>
                     <Text style={as.tlLabel}>행사가</Text>
-                    <View style={[s.stepper, {flex:1}]}>
-                      <TouchableOpacity onPress={() => setAutoConfig(c => ({...c, putStrike: +(c.putStrike - 2.5).toFixed(2)}))} style={s.stepBtn} disabled={autoStatus === 'monitoring'}>
-                        <Text style={s.stepBtnText}>−</Text>
-                      </TouchableOpacity>
-                      <Text style={[s.stepVal, {color:C.red}]}>{autoConfig.putStrike.toFixed(2)}</Text>
-                      <TouchableOpacity onPress={() => setAutoConfig(c => ({...c, putStrike: +(c.putStrike + 2.5).toFixed(2)}))} style={s.stepBtn} disabled={autoStatus === 'monitoring'}>
-                        <Text style={s.stepBtnText}>+</Text>
-                      </TouchableOpacity>
+                    <View style={[as.summaryCodeBox, {flex:1, justifyContent:'center'}]}>
+                      <Text style={[as.summaryCode, {color:C.red, fontSize:15}]}>{autoConfig.putStrike.toFixed(2)}</Text>
                     </View>
+                    <Text style={as.tlMeta}>{isFuturesCode ? '검색으로 자동 입력' : '자동 입력'}</Text>
                   </View>
 
                 </View>
@@ -1409,7 +1759,44 @@ const OrderScreen = () => {
                   </View>
                 </View>
 
-                {/* ══ 섹션 4: 시간 설정 ══ */}
+                {/* ══ 섹션 4: 코스피200 업종코드 테스트 ══ */}
+                <View style={as.tlSection}>
+                  <View style={as.tlHeader}>
+                    <View style={[as.tlDot, {backgroundColor: C.blue}]}/>
+                    <Text style={[as.tlTitle, {color: C.blue}]}>코스피200 업종코드 테스트</Text>
+                    <Text style={as.tlDesc}>t8418로 여러 코드 조회 → 900~1000대 값 찾기</Text>
+                  </View>
+                  <View style={as.infoBox}>
+                    <Text style={as.infoText}>
+                      버튼을 누르면 여러 업종코드로 t8418을 조회합니다.{'\n'}
+                      터미널에서 close값이 900~1000대인 코드를 찾으세요.
+                    </Text>
+                  </View>
+                  <TouchableOpacity
+                    style={[s.mainOrderBtn, {backgroundColor: C.blue, marginTop: 8}]}
+                    onPress={async () => {
+                      addLog('🔍 t8418 업종코드 테스트 시작...');
+                      const testCodes = ['001','002','003','004','005','100','101','200','201','202','203','204','205'];
+                      for (const code of testCodes) {
+                        try {
+                          const bars = await getKospi200MinuteBars(2, code);
+                          const closeVal = bars[0]?.close ?? 0;
+                          const msg = `[${code}] close=${closeVal.toFixed(2)} ${closeVal > 800 && closeVal < 1200 ? '👈 코스피200 후보!' : ''}`;
+                          console.log(msg);
+                          addLog(msg);
+                        } catch (e: any) {
+                          const msg = `[${code}] 오류: ${e?.message}`;
+                          console.log(msg);
+                          addLog(msg);
+                        }
+                      }
+                      addLog('✅ 테스트 완료 — 900~1000대 코드 확인');
+                    }}>
+                    <Text style={s.mainOrderBtnText}>🔍 업종코드 테스트</Text>
+                  </TouchableOpacity>
+                </View>
+
+                {/* ══ 섹션 5: 시간 설정 ══ */}
                 <View style={as.tlSection}>
                   <View style={as.tlHeader}>
                     <View style={as.tlDot}/>
@@ -1419,41 +1806,71 @@ const OrderScreen = () => {
 
                   {/* 시간 조절 헬퍼 */}
                   {(['monitorStart', 'orderDeadline'] as const).map(field => {
-                    const val   = autoConfig[field];               // "HH:MM:SS"
+                    const val  = autoConfig[field];
                     const [hh, mm] = val.split(':').map(Number);
-                    const label = field === 'monitorStart' ? '모니터링 시작' : '주문 마감';
-                    const color = field === 'monitorStart' ? C.green : C.red;
+                    const label    = field === 'monitorStart' ? '모니터링 시작' : '주문 마감';
+                    const color    = field === 'monitorStart' ? C.green : C.red;
+                    const disabled = autoStatus === 'monitoring';
 
                     const setTime = (newHH: number, newMM: number) => {
-                      const t = `${String(Math.max(0,Math.min(23,newHH))).padStart(2,'0')}:${String(Math.max(0,Math.min(59,newMM))).padStart(2,'0')}:00`;
-                      setAutoConfig(c => ({...c, [field]: t}));
+                      const h = String(Math.max(0, Math.min(23, newHH))).padStart(2, '0');
+                      const m = String(Math.max(0, Math.min(59, newMM))).padStart(2, '0');
+                      setAutoConfig(c => ({...c, [field]: `${h}:${m}:00`}));
                     };
 
                     return (
                       <View key={field} style={{gap:4}}>
                         <Text style={[as.tlLabel, {color}]}>{label}</Text>
                         <View style={{flexDirection:'row', alignItems:'center', gap:8}}>
+
                           {/* 시 스텝퍼 */}
                           <View style={[s.stepper, {flex:1}]}>
-                            <TouchableOpacity onPress={() => setTime(hh-1, mm)} style={s.stepBtn} disabled={autoStatus==='monitoring'}>
+                            <TouchableOpacity onPress={() => setTime(hh - 1, mm)} style={s.stepBtn} disabled={disabled}>
                               <Text style={s.stepBtnText}>−</Text>
                             </TouchableOpacity>
-                            <Text style={[s.stepVal, {color, fontSize:16}]}>{String(hh).padStart(2,'0')}시</Text>
-                            <TouchableOpacity onPress={() => setTime(hh+1, mm)} style={s.stepBtn} disabled={autoStatus==='monitoring'}>
+                            <TextInput
+                              style={[s.stepVal, {color, fontSize:16, textAlign:'center', padding:0}]}
+                              value={String(hh).padStart(2, '0')}
+                              onChangeText={v => {
+                                const n = parseInt(v, 10);
+                                if (!isNaN(n)) setTime(Math.max(0, Math.min(23, n)), mm);
+                                else if (v === '') setTime(0, mm);
+                              }}
+                              keyboardType="number-pad"
+                              maxLength={2}
+                              editable={!disabled}
+                              selectTextOnFocus
+                            />
+                            <TouchableOpacity onPress={() => setTime(hh + 1, mm)} style={s.stepBtn} disabled={disabled}>
                               <Text style={s.stepBtnText}>+</Text>
                             </TouchableOpacity>
                           </View>
+
                           <Text style={{fontSize:14, color:C.dimText}}>:</Text>
+
                           {/* 분 스텝퍼 */}
                           <View style={[s.stepper, {flex:1}]}>
-                            <TouchableOpacity onPress={() => setTime(hh, mm-1)} style={s.stepBtn} disabled={autoStatus==='monitoring'}>
+                            <TouchableOpacity onPress={() => setTime(hh, mm - 1)} style={s.stepBtn} disabled={disabled}>
                               <Text style={s.stepBtnText}>−</Text>
                             </TouchableOpacity>
-                            <Text style={[s.stepVal, {color, fontSize:16}]}>{String(mm).padStart(2,'0')}분</Text>
-                            <TouchableOpacity onPress={() => setTime(hh, mm+1)} style={s.stepBtn} disabled={autoStatus==='monitoring'}>
+                            <TextInput
+                              style={[s.stepVal, {color, fontSize:16, textAlign:'center', padding:0}]}
+                              value={String(mm).padStart(2, '0')}
+                              onChangeText={v => {
+                                const n = parseInt(v, 10);
+                                if (!isNaN(n)) setTime(hh, Math.max(0, Math.min(59, n)));
+                                else if (v === '') setTime(hh, 0);
+                              }}
+                              keyboardType="number-pad"
+                              maxLength={2}
+                              editable={!disabled}
+                              selectTextOnFocus
+                            />
+                            <TouchableOpacity onPress={() => setTime(hh, mm + 1)} style={s.stepBtn} disabled={disabled}>
                               <Text style={s.stepBtnText}>+</Text>
                             </TouchableOpacity>
                           </View>
+
                         </View>
                       </View>
                     );
@@ -1489,6 +1906,14 @@ const OrderScreen = () => {
                             <Text style={as.statusSubVal}>{autoFutPrice.toFixed(2)}</Text>
                           </View>
                         )}
+                        {kospiSampleCount > 0 && (
+                          <View>
+                            <Text style={as.statusSubLabel}>현물 샘플</Text>
+                            <Text style={[as.statusSubVal, {color: kospiSampleCount >= 10 ? C.green : C.orange}]}>
+                              {kospiSampleCount}/10
+                            </Text>
+                          </View>
+                        )}
                       </View>
                     )}
                   </View>
@@ -1498,34 +1923,42 @@ const OrderScreen = () => {
                     <Text style={[as.statusText, {color:C.red}]}>오류 발생 — 조회/수정 탭 로그를 확인하세요</Text>
                   </View>
                 )}
-                {/* ── 등록 / 중지 버튼 ── */}
-                {/* 항상 등록 버튼 표시 — 모니터링 중에는 현재 모니터링 유지하면서 새 종목 저장만 */}
-                <TouchableOpacity
-                  style={[s.mainOrderBtn, {backgroundColor: C.green}]}
-                  onPress={() => {
-                    const lines = [
-                      `풋옵션: ${autoConfig.putOptCode || shcode} / 행사가: ${autoConfig.putStrike}`,
-                      autoConfig.exitEnabled ? `청산 예약: ${autoConfig.exitThreshold.toFixed(2)}P 이하` : '',
-                      `선물 매수: ${autoConfig.futuresCode} ${autoConfig.futuresQty}계약`,
-                      '',
-                      autoStatus === 'monitoring'
-                        ? '현재 모니터링을 유지하면서 이 설정을 추가 저장합니다.'
-                        : '자동화를 등록하시겠습니까?',
-                    ].filter(Boolean).join('\n');
-                    Alert.alert('자동화 등록 확인', lines, [
-                      {text: '취소', style: 'cancel'},
-                      {text: '등록', onPress: () => {
-                        saveAutoConfig(autoConfig);
-                        if (autoStatus !== 'monitoring') {
-                          startAutoMonitor();
-                        } else {
-                          addLog(`➕ 추가 등록: ${autoConfig.putOptCode} / 행사가: ${autoConfig.putStrike}`);
-                        }
-                      }},
-                    ]);
-                  }}>
-                  <Text style={s.mainOrderBtnText}>등록</Text>
-                </TouchableOpacity>
+                {/* ── 등록 / 수정 / 중지 버튼 ── */}
+                {(() => {
+                  const isExisting = !!(autoConfig.putOptCode && allSavedConfigs[autoConfig.putOptCode]);
+                  const btnLabel = isExisting ? '수정' : '등록';
+                  const confirmTitle = isExisting ? '자동화 수정 확인' : '자동화 등록 확인';
+                  const confirmMsg = autoStatus === 'monitoring'
+                    ? '현재 모니터링을 유지하면서 이 설정을 저장합니다.'
+                    : isExisting ? '자동화 설정을 수정하시겠습니까?' : '자동화를 등록하시겠습니까?';
+                  return (
+                    <TouchableOpacity
+                      style={[s.mainOrderBtn, {backgroundColor: C.green}]}
+                      onPress={() => {
+                        const lines = [
+                          `풋옵션: ${autoConfig.putOptCode || shcode} / 행사가: ${autoConfig.putStrike}`,
+                          autoConfig.exitEnabled ? `청산 예약: ${autoConfig.exitThreshold.toFixed(2)}P 이하` : '',
+                          `선물 매수: ${autoConfig.futuresCode} ${autoConfig.futuresQty}계약`,
+                          '',
+                          confirmMsg,
+                        ].filter(Boolean).join('\n');
+                        Alert.alert(confirmTitle, lines, [
+                          {text: '취소', style: 'cancel'},
+                          {text: btnLabel, onPress: () => {
+                            saveAutoConfig(autoConfig);
+                            if (autoStatus !== 'monitoring') {
+                              startAutoMonitor();
+                            } else {
+                              addLog(`➕ ${isExisting ? '수정' : '추가'} 등록: ${autoConfig.putOptCode} / 행사가: ${autoConfig.putStrike}`);
+                            }
+                            setAutoSubTab('조회');
+                          }},
+                        ]);
+                      }}>
+                      <Text style={s.mainOrderBtnText}>{btnLabel}</Text>
+                    </TouchableOpacity>
+                  );
+                })()}
                 {autoStatus === 'monitoring' && (
                   <TouchableOpacity
                     style={[s.mainOrderBtn, {backgroundColor: C.orange, marginTop:8}]}
@@ -1548,7 +1981,7 @@ const OrderScreen = () => {
             {/* ══════════════════════════════════════════════
                 서브탭: 조회
             ══════════════════════════════════════════════ */}
-            {autoSubTab === '조회/수정' && (
+            {autoSubTab === '조회' && (
               <ScrollView style={{flex:1}} contentContainerStyle={{padding:12, gap:10}}>
 
                 {/* 현재 자동화 설정 요약 */}
@@ -1557,11 +1990,9 @@ const OrderScreen = () => {
                 {Object.keys(allSavedConfigs).length === 0 ? (
                   <View style={as.emptyBox}>
                     <Text style={as.emptyText}>등록된 자동화가 없습니다</Text>
-                    {!isFuturesCode && (
-                      <TouchableOpacity onPress={() => setAutoSubTab('추가')} style={{marginTop:12}}>
+                      <TouchableOpacity onPress={() => setAutoSubTab('추가/수정')} style={{marginTop:12}}>
                         <Text style={{color:C.green, fontWeight:'700', fontSize:13}}>+ 자동화 추가하기</Text>
                       </TouchableOpacity>
-                    )}
                   </View>
                 ) : (
                   <>
@@ -1615,16 +2046,27 @@ const OrderScreen = () => {
                           ))}
 
                           {/* 이 항목 선택해서 수정/모니터링 */}
-                          {autoStatus !== 'monitoring' && (
-                            <TouchableOpacity
-                              style={[s.mainOrderBtn, {backgroundColor: C.navy, marginTop:8}]}
-                              onPress={() => {
+                          <TouchableOpacity
+                              style={{
+                                flexDirection: 'row',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                gap: 6,
+                                marginTop: 10,
+                                paddingVertical: 10,
+                                paddingHorizontal: 20,
+                                borderRadius: 8,
+                                borderWidth: 1.5,
+                                borderColor: C.navy,
+                                backgroundColor: '#EEF2FF',
+                                alignSelf: 'flex-end',
+                              }}
+                              onPress={async () => {
                                 setAutoConfig({...cfg});
-                                setAutoSubTab('추가');
+                                setAutoSubTab('추가/수정');
                               }}>
-                              <Text style={s.mainOrderBtnText}>이 설정으로 수정/등록</Text>
+                              <Text style={{fontSize: 13, fontWeight: '700', color: C.navy}}>✏️ 수정</Text>
                             </TouchableOpacity>
-                          )}
                         </View>
                       );
                     })}
@@ -1690,9 +2132,21 @@ const OrderScreen = () => {
                 <Text style={{fontSize:12, color:C.subText}}>손익</Text>
                 <Text style={{fontSize:12, fontWeight:'600'}}>0원</Text>
               </View>
-              <View style={{flexDirection:'row', gap:10}}>
-                {['가능','신규','청산','총가능'].map(t => (
-                  <Text key={t} style={{fontSize:12, color:'#555', textDecorationLine:'underline'}}>{t}</Text>
+              <View style={{flexDirection:'row', gap:10, alignItems:'center'}}>
+                {ableQtyLoading ? (
+                  <ActivityIndicator size="small" color={C.navy} style={{marginRight:4}}/>
+                ) : null}
+                {[
+                  {label: '가능', qty: ableQty ?? 0},
+                  {label: '신규', qty: ableQty ?? 0},
+                  {label: '청산', qty: closeQty ?? 0},
+                  {label: '총가능', qty: (ableQty ?? 0) + (closeQty ?? 0)},
+                ].map(({label, qty: q}) => (
+                  <TouchableOpacity key={label} onPress={() => setQty(q)} disabled={ableQtyLoading}>
+                    <Text style={{fontSize:12, color: q > 0 ? C.navy : C.dimText, textDecorationLine:'underline', fontWeight: q > 0 ? '600' : '400'}}>
+                      {label}{q > 0 ? `(${q})` : ''}
+                    </Text>
+                  </TouchableOpacity>
                 ))}
               </View>
               <View style={s.stepper}>
