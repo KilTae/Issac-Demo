@@ -42,7 +42,6 @@ const nowKST = (): string => {
 const appendLog = async (msg: string) => {
   const ts   = nowKST();
   const line = `[${ts}] ${msg}`;
-  console.log('🤖', line);
   try {
     const val  = await AsyncStorage.getItem(LOG_KEY);
     const logs: string[] = val ? JSON.parse(val) : [];
@@ -87,20 +86,72 @@ const toMinutes = (hhmm: string): number => {
   return h * 60 + m;
 };
 
+// ── 위클리 만기일 계산 ────────────────────────────────────────────────────────
+// hname 예) "P 목 W3 937.5" → 이번 달 3번째 목요일
+//          "P 월 W1 937.5" → 이번 달 1번째 월요일
+//          "P 월 W2 937.5" → 이번 달 2번째 월요일
+const getWeeklyExpiryDate = (hname: string): Date | null => {
+  // 형식1: "P 3주 목요일 937.50"
+  // 형식2: "P 목 W3 937.5"
+  const isMon = hname.includes('월요일') || hname.includes('월 W') || /P 월 /.test(hname);
+  const isThu = hname.includes('목요일') || hname.includes('목 W') || /P 목 /.test(hname);
+  if (!isMon && !isThu) return null;
+  const targetDow = isMon ? 1 : 4;
+
+  // 주차: "3주" 또는 "W3" 형식 모두 지원
+  const weekMatch = hname.match(/(\d)주/) || hname.match(/W(\d)/);
+  if (!weekMatch) return null;
+  const weekNum = parseInt(weekMatch[1], 10);
+
+  // 이번 달 기준으로 n번째 요일 찾기
+  const now = new Date(new Date().getTime() + 9 * 60 * 60 * 1000); // KST
+  const year  = now.getUTCFullYear();
+  const month = now.getUTCMonth();
+
+  let count = 0;
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  for (let d = 1; d <= daysInMonth; d++) {
+    const date = new Date(year, month, d);
+    if (date.getDay() === targetDow) {
+      count++;
+      if (count === weekNum) return date;
+    }
+  }
+  return null;
+};
+
+// ── 오늘이 만기일 1일 전인지 확인 (일자만 비교) ──────────────────────────────
+const isTodayExpiryDate = (hname: string): boolean => {
+  const expiryDate = getWeeklyExpiryDate(hname);
+  if (!expiryDate) return true; // 날짜 파악 불가 시 항상 실행
+  const now = new Date(new Date().getTime() + 9 * 60 * 60 * 1000);
+  // 만기일 1일 전 날짜 계산
+  const dayBefore = new Date(expiryDate);
+  dayBefore.setDate(expiryDate.getDate() - 1);
+  return dayBefore.getDate() === now.getUTCDate();
+};
+
 // ── 종목별 샘플 저장소 (백그라운드용) ────────────────────────────────────────
 const kospiSampleMap: Record<string, number[]> = {};
 
 // ── 단일 자동화 설정 실행 ─────────────────────────────────────────────────────
 const runSingleConfig = async (cfg: any) => {
   const now = nowKST();
+  // 주문 마감시간 14:50:00 고정
+  const ORDER_DEADLINE = '15:32:00';
 
-  if (now < cfg.monitorStart) {
-    await appendLog(`[${cfg.putOptCode}] ⏳ ${cfg.monitorStart} 이후 활성화 (현재 ${now})`);
+  // 날짜 조건 체크 — 만기일이 아니면 스킵
+  if (!isTodayExpiryDate(cfg.putOptHname || '')) {
+    const expiryDate = getWeeklyExpiryDate(cfg.putOptHname || '');
+    const expiryStr  = expiryDate
+      ? `${expiryDate.getMonth()+1}/${expiryDate.getDate()}`
+      : '알 수 없음';
+    await appendLog(`[${cfg.putOptCode}] 📅 오늘은 만기일이 아님 (만기: ${expiryStr}) — 대기 중`);
     return;
   }
 
-  if (now >= cfg.orderDeadline) {
-    await appendLog(`[${cfg.putOptCode}] ⏰ 마감 시각 ${cfg.orderDeadline} 도달`);
+  if (now >= ORDER_DEADLINE) {
+    await appendLog(`[${cfg.putOptCode}] ⏰ 마감 시각 ${ORDER_DEADLINE} 도달`);
     const futCode   = cfg.futuresCode || 'A0166000';
     const priceData = await getFuturesPrice(futCode);
     const futPrice  = priceData.price;
@@ -111,7 +162,7 @@ const runSingleConfig = async (cfg: any) => {
     if (samples.length > 0) {
       kospi200 = +(samples.reduce((a, b) => a + b, 0) / samples.length).toFixed(2);
       // 샘플 목록 상세 로그
-      const deadlineMin2 = toMinutes(cfg.orderDeadline.slice(0, 5));
+      const deadlineMin2 = toMinutes(ORDER_DEADLINE.slice(0, 5));
       const sampleStart2 = deadlineMin2 - 10;
       const sampleList = samples
         .map((v, i) => {
@@ -165,7 +216,7 @@ const runSingleConfig = async (cfg: any) => {
         await appendLog(`[${cfg.putOptCode}] ✅ 선물 매수 완료 — 주문번호: ${b2.OrdNo}`);
         const sampleDetailBg = samples.length > 0
           ? `\n\n[코스피200 샘플 ${samples.length}개]\n` + samples.map((v, i) => {
-              const dm = toMinutes(cfg.orderDeadline.slice(0, 5));
+              const dm = toMinutes(ORDER_DEADLINE.slice(0, 5));
               const m = (dm - 10) + i;
               return `${String(Math.floor(m/60)).padStart(2,'0')}:${String(m%60).padStart(2,'0')} → ${v.toFixed(2)}`;
             }).join('\n') + `\n평균: ${kospi200.toFixed(2)}`
@@ -232,7 +283,7 @@ const runSingleConfig = async (cfg: any) => {
 
     // ── 코스피200 샘플 수집 (deadline 10분 전부터 1분 간격) ──────────────────
     const nowMin      = toMinutes(now.slice(0, 5));
-    const deadlineMin = toMinutes(cfg.orderDeadline.slice(0, 5));
+    const deadlineMin = toMinutes(ORDER_DEADLINE.slice(0, 5));
     const sampleStart = deadlineMin - 10;
     const nowSec      = parseInt(now.slice(6, 8), 10);
 
@@ -346,8 +397,8 @@ const runSingleConfig = async (cfg: any) => {
 
     await appendLog(`[${cfg.putOptCode}] 코스피: ${kospi200.toFixed(2)} | 옵션: ${optPrice.toFixed(2)}P | 선물: ${futPrice.toFixed(2)}${(kospiSampleMap[cfg.putOptCode]?.length ?? 0) > 0 ? ` | 샘플 ${kospiSampleMap[cfg.putOptCode].length}/10` : ''}`);
 
-    if (cfg.exitEnabled && optPrice <= cfg.exitThreshold) {
-      await appendLog(`[${cfg.putOptCode}] ⚠️ 청산 조건 충족 — 주문 시작`);
+    if (cfg.exitEnabled && cfg.exitPrice > 0 && optPrice <= cfg.exitPrice) {
+      await appendLog(`[${cfg.putOptCode}] ⚠️ 청산 조건 충족 — 옵션가 ${optPrice.toFixed(2)} ≤ 기준가 ${cfg.exitPrice.toFixed(2)} — 주문 시작`);
       try {
         const res = await placeOrder({
           fnoIsuNo:  cfg.putOptCode,
@@ -363,7 +414,7 @@ const runSingleConfig = async (cfg: any) => {
           ts:      nowKST(),
           optCode: cfg.putOptCode,
           message: `✅ 풋옵션 자동 청산 완료`,
-          detail:  `종목: ${cfg.putOptCode}\n주문번호: ${b2?.OrdNo ?? '-'}\n청산가: ${optPrice.toFixed(2)}P\n(기준가: ${cfg.exitThreshold.toFixed(2)}P 이하 도달)`,
+          detail:  `종목: ${cfg.putOptCode}\n주문번호: ${b2?.OrdNo ?? '-'}\n청산가: ${optPrice.toFixed(2)}P\n(기준가: ${cfg.exitPrice.toFixed(2)}P 이하 도달)`,
         });
 
         // 완료된 설정 삭제

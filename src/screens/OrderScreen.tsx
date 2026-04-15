@@ -14,10 +14,10 @@ import {NativeStackNavigationProp} from '@react-navigation/native-stack';
 import {RootStackParamList} from '../navigation/RootNavigator';
 import {
   placeOrder, modifyOrder, cancelOrder, getPendingOrders, getFuturesOrders,
-  getFuturesHoga, getFuturesBalance,
+  getFuturesHoga, getFuturesPrice, getFuturesBalance, getWeeklyOptionBoard,
   getKospi200MinuteBars,
   getFuturesAccountInfo,
-  FuturesOrderItem, FuturesBalanceHolding, FuturesBalanceSummary,
+  FuturesOrderItem, FuturesBalanceHolding, FuturesBalanceSummary, FuturesPrice,
   OrderPriceType,
 } from '../api/lsApi';
 
@@ -58,9 +58,8 @@ interface AutoConfig {
   futuresCode:   string;
   futuresQty:    number;
   exitThreshold: number;
+  exitPrice:     number;
   exitEnabled:   boolean;
-  monitorStart:  string;
-  orderDeadline: string;
 }
 
 const CandleIcon = ({color, size = 28}: {color: string; size?: number}) => {
@@ -220,6 +219,9 @@ const OrderScreen = () => {
   const [autoLog,           setAutoLog]           = useState<string[]>([]);
   const [allSavedConfigs,   setAllSavedConfigs]   = useState<Record<string, AutoConfig>>({});
   const [bgRunning,         setBgRunning]         = useState(false);
+  const [autoFutPrice,      setAutoFutPrice]      = useState<number | null>(null);
+  const [autoKospi,         setAutoKospi]         = useState<number | null>(null);
+  const [autoOptPrice,      setAutoOptPrice]      = useState<number | null>(null);
 
   const RESULT_KEY = 'autoResults';
 
@@ -296,9 +298,8 @@ const OrderScreen = () => {
     futuresCode:       isFuturesCode ? (shcode ?? '') : getNearestFuturesCode().code,
     futuresQty:        1,
     exitThreshold:     0.20,
+    exitPrice:         0,
     exitEnabled:       true,
-    monitorStart:      '15:32:00',
-    orderDeadline:     '15:35:00',
   });
 
   // selectedOpt: FuturesSearchScreen에서 선택된 종목 반영
@@ -327,6 +328,31 @@ const OrderScreen = () => {
   };
 
 
+  // ── 자동화 탭 진입 시 선물가 + 코스피200 + 옵션가 즉시 조회 ──────────────
+  useEffect(() => {
+    if (tab !== '자동화') return;
+    let futCode = autoConfig.futuresCode;
+    if (!futCode) {
+      const now = new Date();
+      const quarters = [3, 6, 9, 12];
+      let y = now.getFullYear();
+      let m = now.getMonth() + 1;
+      const next = quarters.find(q => q >= m) ?? quarters[0];
+      if (next < m) y += 1;
+      const monthCode = next <= 9 ? String(next) : String.fromCharCode(55 + next);
+      futCode = `A016${monthCode}000`;
+    }
+    getFuturesPrice(futCode)
+      .then(d => { setAutoFutPrice(d.price); setAutoKospi(d.kospijisu); })
+      .catch(() => {});
+    // 풋옵션 종목코드 있으면 현재 옵션가도 조회
+    if (autoConfig.putOptCode) {
+      getFuturesHoga(autoConfig.putOptCode)
+        .then(d => setAutoOptPrice(d.price))
+        .catch(() => {});
+    }
+  }, [tab]);
+
   // ── 자동화 설정 저장/불러오기 (AsyncStorage) ──────────────────────────────
   const STORAGE_KEY = 'autoConfigs';
   const isConfigLoaded = useRef(false);
@@ -342,7 +368,7 @@ const OrderScreen = () => {
             const saved = all[shcode];
             if (saved) {
               setAutoConfig(prev => ({...prev, ...saved}));
-              console.log('✅ 자동화 설정 불러옴:', shcode);
+        
             }
           }
         } catch {}
@@ -361,7 +387,7 @@ const OrderScreen = () => {
       all[saveKey] = cfg;
       await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(all));
       setAllSavedConfigs({...all});
-      console.log('💾 자동화 저장 완료:', saveKey);
+
     } catch (e) {
       console.log('❌ 자동화 저장 실패:', e);
     }
@@ -375,11 +401,11 @@ const OrderScreen = () => {
       delete all[optCode];
       await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(all));
       setAllSavedConfigs({...all});
-      console.log('🗑 자동화 삭제:', optCode);
+
 
       // 남은 설정 없으면 백그라운드 서비스도 자동 중지
       if (Object.keys(all).length === 0 && isBackgroundServiceRunning()) {
-        console.log('🛑 자동화 전체 완료 — 백그라운드 서비스 중지');
+
         stopBackgroundService().then(() => setBgRunning(false)).catch(() => {});
       }
     } catch (e) {
@@ -474,7 +500,7 @@ const OrderScreen = () => {
     setSelectedOrder(null);
     try {
       const list = await getFuturesOrders('', '2', '1');
-      console.log('📋 미체결 조회 결과:', JSON.stringify(list, null, 2));
+
       setPendingOrders(list);
       setPendingSheetVisible(true);
     } catch (e: any) {
@@ -1121,6 +1147,79 @@ const OrderScreen = () => {
 
                 </View>
 
+                {/* ── 선물-현물 / 행사-현물 ── */}
+                <View style={as.tlSection}>
+                  <View style={as.tlHeader}>
+                    <View style={as.tlDot}/>
+                    <Text style={as.tlTitle}>현물 대비</Text>
+                    {(autoFutPrice === null || autoKospi === null) && (
+                      <Text style={as.tlDesc}>자동화 탭 진입 시 자동 조회</Text>
+                    )}
+                  </View>
+
+                  {/* 선물 - 현물 */}
+                  <View style={as.tlRow}>
+                    <Text style={as.tlLabel}>선물 - 현물</Text>
+                    <View style={as.diffBox}>
+                      {autoFutPrice !== null && autoKospi !== null ? (
+                        <Text style={as.diffText}>
+                          {autoFutPrice.toFixed(2)}
+                          <Text style={{color:C.subText}}> - </Text>
+                          {autoKospi.toFixed(2)}
+                          <Text style={{color:C.subText}}> = </Text>
+                          <Text style={{color: (autoFutPrice - autoKospi) >= 0 ? C.red : C.blue, fontWeight:'800'}}>
+                            {(autoFutPrice - autoKospi).toFixed(2)}
+                          </Text>
+                        </Text>
+                      ) : (
+                        <Text style={[as.diffText, {color:C.dimText}]}>조회 중...</Text>
+                      )}
+                    </View>
+                  </View>
+
+                  {/* 행사 - 현물 */}
+                  <View style={as.tlRow}>
+                    <Text style={as.tlLabel}>행사 - 현물</Text>
+                    <View style={as.diffBox}>
+                      {autoKospi !== null ? (
+                        <Text style={as.diffText}>
+                          {autoConfig.putStrike.toFixed(2)}
+                          <Text style={{color:C.subText}}> - </Text>
+                          {autoKospi.toFixed(2)}
+                          <Text style={{color:C.subText}}> = </Text>
+                          <Text style={{color: (autoConfig.putStrike - autoKospi) >= 0 ? C.red : C.blue, fontWeight:'800'}}>
+                            {(autoConfig.putStrike - autoKospi).toFixed(2)}
+                          </Text>
+                        </Text>
+                      ) : (
+                        <Text style={[as.diffText, {color:C.dimText}]}>조회 중...</Text>
+                      )}
+                    </View>
+                  </View>
+
+                  {/* 새로고침 */}
+                  <TouchableOpacity
+                    onPress={() => {
+                      let futCode = autoConfig.futuresCode;
+                      if (!futCode) {
+                        const now = new Date();
+                        const quarters = [3, 6, 9, 12];
+                        let y = now.getFullYear();
+                        let m = now.getMonth() + 1;
+                        const next = quarters.find(q => q >= m) ?? quarters[0];
+                        if (next < m) y += 1;
+                        const monthCode = next <= 9 ? String(next) : String.fromCharCode(55 + next);
+                        futCode = `A016${monthCode}000`;
+                      }
+                      getFuturesPrice(futCode)
+                        .then(d => { setAutoFutPrice(d.price); setAutoKospi(d.kospijisu); })
+                        .catch(() => {});
+                    }}
+                    style={{alignSelf:'flex-end'}}>
+                    <Text style={{fontSize:11, color:C.navy, fontWeight:'600'}}>새로고침</Text>
+                  </TouchableOpacity>
+                </View>
+
                 {/* ══ 섹션 2: 청산 기준 ══ */}
                 <View style={as.tlSection}>
                   <View style={as.tlHeader}>
@@ -1182,6 +1281,25 @@ const OrderScreen = () => {
                       <Text style={as.nowExitBtnText}>지금{'\n'}청산</Text>
                     </TouchableOpacity>
                   </View>
+
+                  {/* 청산 기준 안내 */}
+                  {autoConfig.exitEnabled && (
+                    <View style={{paddingTop:4, paddingHorizontal:2, gap:2}}>
+                      <Text style={{fontSize:11, color:C.subText}}>
+                        현재 옵션가{autoOptPrice !== null ? `(${autoOptPrice.toFixed(2)})` : ''} - {autoConfig.exitThreshold.toFixed(2)} = 자동 청산 기준가
+                      </Text>
+                      {autoConfig.exitPrice > 0 && (
+                        <Text style={{fontSize:12, fontWeight:'700', color:C.orange}}>
+                          📌 등록된 청산 기준가: {autoConfig.exitPrice.toFixed(2)} P
+                        </Text>
+                      )}
+                      {autoConfig.exitPrice === 0 && (
+                        <Text style={{fontSize:11, color:C.dimText}}>
+                          등록 버튼 누를 때 현재 옵션가 기준으로 자동 계산됩니다
+                        </Text>
+                      )}
+                    </View>
+                  )}
                 </View>
 
                 {/* ══ 섹션 3: 선물 자동 매수 ══ */}
@@ -1224,133 +1342,56 @@ const OrderScreen = () => {
                   </View>
                 </View>
 
-                {/* ══ 섹션 4: 코스피200 업종코드 테스트 ══ */}
-                <View style={as.tlSection}>
-                  <View style={as.tlHeader}>
-                    <View style={[as.tlDot, {backgroundColor: C.blue}]}/>
-                    <Text style={[as.tlTitle, {color: C.blue}]}>코스피200 업종코드 테스트</Text>
-                    <Text style={as.tlDesc}>t8418로 여러 코드 조회 → 900~1000대 값 찾기</Text>
-                  </View>
-                  <View style={as.infoBox}>
-                    <Text style={as.infoText}>
-                      버튼을 누르면 여러 업종코드로 t8418을 조회합니다.{'\n'}
-                      터미널에서 close값이 900~1000대인 코드를 찾으세요.
-                    </Text>
-                  </View>
-                  <TouchableOpacity
-                    style={[s.mainOrderBtn, {backgroundColor: C.blue, marginTop: 8}]}
-                    onPress={async () => {
-                      addLog('🔍 t8418 업종코드 테스트 시작...');
-                      const testCodes = ['001','002','003','004','005','100','101','200','201','202','203','204','205'];
-                      for (const code of testCodes) {
-                        try {
-                          const bars = await getKospi200MinuteBars(2, code);
-                          const closeVal = bars[0]?.close ?? 0;
-                          const msg = `[${code}] close=${closeVal.toFixed(2)} ${closeVal > 800 && closeVal < 1200 ? '👈 코스피200 후보!' : ''}`;
-                          console.log(msg);
-                          addLog(msg);
-                        } catch (e: any) {
-                          const msg = `[${code}] 오류: ${e?.message}`;
-                          console.log(msg);
-                          addLog(msg);
-                        }
-                      }
-                      addLog('✅ 테스트 완료 — 900~1000대 코드 확인');
-                    }}>
-                    <Text style={s.mainOrderBtnText}>🔍 업종코드 테스트</Text>
-                  </TouchableOpacity>
-                </View>
-
-                {/* ══ 섹션 5: 시간 설정 ══ */}
+                {/* ══ 섹션 4: 시간 설정 ══ */}
                 <View style={as.tlSection}>
                   <View style={as.tlHeader}>
                     <View style={as.tlDot}/>
                     <Text style={as.tlTitle}>시간 설정</Text>
-                    <Text style={as.tlDesc}>모니터링 시작 ~ 주문 마감 시간을 설정하세요</Text>
+                    <Text style={as.tlDesc}>만기일 1일 전 15:32:00에 자동 실행</Text>
                   </View>
+                  <View style={as.infoBox}>
+                    {(() => {
+                      // 종목명에서 만기일 계산
+                      // 형식1: "P 3주 목요일 937.50"
+                      // 형식2: "P 목 W3 937.5"
+                      const hname = autoConfig.putOptHname || autoConfig.putOptCode || '';
+                      const isMon = hname.includes('월요일') || hname.includes('월 W') || /P 월 /.test(hname);
+                      const isThu = hname.includes('목요일') || hname.includes('목 W') || /P 목 /.test(hname);
+                      // 주차: "3주" 또는 "W3" 형식 모두 지원
+                      const weekMatch = hname.match(/(\d)주/) || hname.match(/W(\d)/);
+                      const weekNum = weekMatch ? parseInt(weekMatch[1], 10) : 0;
+                      const targetDow = isMon ? 1 : isThu ? 4 : -1;
+                      const dayNames = ['일', '월', '화', '수', '목', '금', '토'];
 
-                  {/* 시간 조절 헬퍼 */}
-                  {(['monitorStart', 'orderDeadline'] as const).map(field => {
-                    const val  = autoConfig[field];
-                    const [hh, mm] = val.split(':').map(Number);
-                    const label    = field === 'monitorStart' ? '모니터링 시작' : '주문 마감';
-                    const color    = field === 'monitorStart' ? C.green : C.red;
-                    const disabled = false;
-
-                    const setTime = (newHH: number, newMM: number) => {
-                      const h = String(Math.max(0, Math.min(23, newHH))).padStart(2, '0');
-                      const m = String(Math.max(0, Math.min(59, newMM))).padStart(2, '0');
-                      setAutoConfig(c => ({...c, [field]: `${h}:${m}:00`}));
-                    };
-
-                    return (
-                      <View key={field} style={{gap:4}}>
-                        <Text style={[as.tlLabel, {color}]}>{label}</Text>
-                        <View style={{flexDirection:'row', alignItems:'center', gap:8}}>
-
-                          {/* 시 스텝퍼 */}
-                          <View style={[s.stepper, {flex:1}]}>
-                            <TouchableOpacity onPress={() => setTime(hh - 1, mm)} style={s.stepBtn} disabled={disabled}>
-                              <Text style={s.stepBtnText}>−</Text>
-                            </TouchableOpacity>
-                            <TextInput
-                              style={[s.stepVal, {color, fontSize:16, textAlign:'center', padding:0}]}
-                              value={String(hh).padStart(2, '0')}
-                              onChangeText={v => {
-                                const n = parseInt(v, 10);
-                                if (!isNaN(n)) setTime(Math.max(0, Math.min(23, n)), mm);
-                                else if (v === '') setTime(0, mm);
-                              }}
-                              keyboardType="number-pad"
-                              maxLength={2}
-                              editable={!disabled}
-                              selectTextOnFocus
-                            />
-                            <TouchableOpacity onPress={() => setTime(hh + 1, mm)} style={s.stepBtn} disabled={disabled}>
-                              <Text style={s.stepBtnText}>+</Text>
-                            </TouchableOpacity>
-                          </View>
-
-                          <Text style={{fontSize:14, color:C.dimText}}>:</Text>
-
-                          {/* 분 스텝퍼 */}
-                          <View style={[s.stepper, {flex:1}]}>
-                            <TouchableOpacity onPress={() => setTime(hh, mm - 1)} style={s.stepBtn} disabled={disabled}>
-                              <Text style={s.stepBtnText}>−</Text>
-                            </TouchableOpacity>
-                            <TextInput
-                              style={[s.stepVal, {color, fontSize:16, textAlign:'center', padding:0}]}
-                              value={String(mm).padStart(2, '0')}
-                              onChangeText={v => {
-                                const n = parseInt(v, 10);
-                                if (!isNaN(n)) setTime(hh, Math.max(0, Math.min(59, n)));
-                                else if (v === '') setTime(hh, 0);
-                              }}
-                              keyboardType="number-pad"
-                              maxLength={2}
-                              editable={!disabled}
-                              selectTextOnFocus
-                            />
-                            <TouchableOpacity onPress={() => setTime(hh, mm + 1)} style={s.stepBtn} disabled={disabled}>
-                              <Text style={s.stepBtnText}>+</Text>
-                            </TouchableOpacity>
-                          </View>
-
-                        </View>
-                      </View>
-                    );
-                  })}
+                      let expiryStr = '알 수 없음';
+                      if (targetDow >= 0 && weekNum > 0) {
+                        const now = new Date();
+                        const year = now.getFullYear();
+                        const month = now.getMonth();
+                        let count = 0;
+                        const daysInMonth = new Date(year, month + 1, 0).getDate();
+                        for (let d = 1; d <= daysInMonth; d++) {
+                          const date = new Date(year, month, d);
+                          if (date.getDay() === targetDow) {
+                            count++;
+                            if (count === weekNum) {
+                              // 만기일 1일 전
+                              const dayBefore = new Date(year, month, d - 1);
+                              expiryStr = `${dayBefore.getMonth()+1}월 ${dayBefore.getDate()}일 (${dayNames[dayBefore.getDay()]})`;
+                              break;
+                            }
+                          }
+                        }
+                      }
+                      return (
+                        <Text style={as.infoText}>
+                          📅 실행일 (만기 1일 전): <Text style={{fontWeight:'800'}}>{expiryStr}</Text>{'\n'}
+                          ⏰ 주문 마감 시각: <Text style={{fontWeight:'800', color:C.red}}>15:32:00</Text> 고정
+                        </Text>
+                      );
+                    })()}
+                  </View>
                 </View>
-
-                {/* ── 백그라운드 서비스 상태 배너 ── */}
-                {bgRunning && (
-                  <View style={[as.statusBanner, {borderColor:C.green, backgroundColor:'#E8F5E9'}]}>
-                    <View style={{flexDirection:'row', alignItems:'center', gap:8}}>
-                      <ActivityIndicator size="small" color={C.green}/>
-                      <Text style={[as.statusText, {color:C.green}]}>백그라운드 자동매매 실행 중</Text>
-                    </View>
-                  </View>
-                )}
 
                 {/* ── 등록 / 수정 버튼 ── */}
                 {(() => {
@@ -1361,25 +1402,38 @@ const OrderScreen = () => {
                   return (
                     <TouchableOpacity
                       style={[s.mainOrderBtn, {backgroundColor: C.green}]}
-                      onPress={() => {
+                      onPress={async () => {
+                        // 등록 시점 옵션가 조회 → exitPrice 계산
+                        let calculatedExitPrice = autoConfig.exitPrice;
+                        if (autoConfig.exitEnabled && autoConfig.putOptCode) {
+                          try {
+                            const hoga = await getFuturesHoga(autoConfig.putOptCode);
+                            calculatedExitPrice = +(hoga.price - autoConfig.exitThreshold).toFixed(2);
+                            addLog(`📌 등록 시점 옵션가: ${hoga.price.toFixed(2)} → 청산 기준가: ${calculatedExitPrice.toFixed(2)}`);
+                          } catch {
+                            addLog('⚠️ 옵션가 조회 실패 — 이전 청산 기준가 유지');
+                          }
+                        }
+                        const cfgToSave = {...autoConfig, exitPrice: calculatedExitPrice};
+
                         const lines = [
-                          `풋옵션: ${autoConfig.putOptCode || shcode} / 행사가: ${autoConfig.putStrike}`,
-                          autoConfig.exitEnabled ? `청산 예약: ${autoConfig.exitThreshold.toFixed(2)}P 이하` : '',
-                          `선물 매수: ${autoConfig.futuresCode} ${autoConfig.futuresQty}계약`,
+                          `풋옵션: ${cfgToSave.putOptCode || shcode} / 행사가: ${cfgToSave.putStrike}`,
+                          cfgToSave.exitEnabled ? `청산 기준가: ${calculatedExitPrice.toFixed(2)}P (현재가 - ${cfgToSave.exitThreshold.toFixed(2)})` : '',
+                          `선물 매수: ${cfgToSave.futuresCode} ${cfgToSave.futuresQty}계약`,
                           '',
                           confirmMsg,
                         ].filter(Boolean).join('\n');
                         Alert.alert(confirmTitle, lines, [
                           {text: '취소', style: 'cancel'},
                           {text: btnLabel, onPress: () => {
-                            saveAutoConfig(autoConfig);
-                            // 백그라운드 서비스 시작 (이미 실행 중이면 스킵)
+                            setAutoConfig(cfgToSave);
+                            saveAutoConfig(cfgToSave);
                             if (!isBackgroundServiceRunning()) {
                               startBackgroundService()
                                 .then(() => setBgRunning(true))
                                 .catch(e => console.log('❌ BG 시작 실패:', e?.message));
                             }
-                            addLog(`✅ ${isExisting ? '수정' : '등록'} 완료: ${autoConfig.putOptCode} / 행사가: ${autoConfig.putStrike}`);
+                            addLog(`✅ ${isExisting ? '수정' : '등록'} 완료: ${cfgToSave.putOptCode} / 청산 기준가: ${calculatedExitPrice.toFixed(2)}`);
                             setAutoSubTab('조회');
                           }},
                         ]);
@@ -1447,7 +1501,7 @@ const OrderScreen = () => {
                             ['행사가',   `${cfg.putStrike.toFixed(2)}`],
                             ['청산 예약', cfg.exitEnabled ? `${cfg.exitThreshold.toFixed(2)} P 이하` : '미사용'],
                             ['선물 매수', `${cfg.futuresCode} / ${cfg.futuresQty}계약`],
-                            ['시간',      `${cfg.monitorStart} ~ ${cfg.orderDeadline}`],
+                            ['시간',      `만기일 1일 전 15:32 자동 실행`],
                           ].map(([label, val]) => (
                             <View key={label} style={as.queryRow}>
                               <Text style={as.queryLabel}>{label}</Text>
