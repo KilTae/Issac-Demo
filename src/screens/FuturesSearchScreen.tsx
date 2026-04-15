@@ -330,15 +330,30 @@ const FuturesSearchScreen = () => {
 
   const handleItemPress = useCallback((shcode: string, hname: string, yyyymm: string = '') => {
     if (selectMode) {
-      // selectMode: goBack하면서 selectedOpt 파라미터로 전달
+      // selectMode: 스택 전체에서 Order 라우트 탐색 (중첩 스택도 포함)
       const state = navigation.getState();
-      const orderRoute = state.routes.find((r: any) => r.name === 'Order') as any;
+
+      // 재귀적으로 모든 라우트에서 Order 찾기
+      const findOrderRoute = (routes: any[]): any => {
+        for (const r of routes) {
+          if (r.name === 'Order') return r;
+          if (r.state?.routes) {
+            const found = findOrderRoute(r.state.routes);
+            if (found) return found;
+          }
+        }
+        return null;
+      };
+
+      const orderRoute = findOrderRoute(state.routes ?? []);
+
       if (orderRoute?.params) {
         navigation.navigate('Order', {
           ...orderRoute.params,
           selectedOpt: { shcode, hname },
         });
       } else {
+        // Order 라우트 못 찾으면 goBack으로 이전 화면에 params 전달
         navigation.goBack();
       }
     } else {

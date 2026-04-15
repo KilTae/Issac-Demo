@@ -147,7 +147,22 @@ const runSingleConfig = async (cfg: any) => {
           qty:       cfg.futuresQty,
         });
         const b2 = res.CFOAT00100OutBlock2;
-        await appendLog(`[${cfg.putOptCode}] ✅ 선물 매수 완료 — 주문번호: ${b2?.OrdNo ?? '-'}`);
+
+        // 주문번호 없으면 실패로 처리
+        if (!b2?.OrdNo) {
+          const errMsg = res.rsp_msg ?? '주문번호가 없습니다. 잔고를 확인해주세요.';
+          await appendLog(`[${cfg.putOptCode}] ❌ 선물 매수 실패 — ${errMsg}`);
+          await appendResult({
+            type:    'error',
+            ts:      nowKST(),
+            optCode: cfg.putOptCode,
+            message: '❌ 선물 매수 실패 — 잔고를 확인해주세요',
+            detail:  errMsg,
+          });
+          return;
+        }
+
+        await appendLog(`[${cfg.putOptCode}] ✅ 선물 매수 완료 — 주문번호: ${b2.OrdNo}`);
         const sampleDetailBg = samples.length > 0
           ? `\n\n[코스피200 샘플 ${samples.length}개]\n` + samples.map((v, i) => {
               const dm = toMinutes(cfg.orderDeadline.slice(0, 5));
@@ -163,13 +178,17 @@ const runSingleConfig = async (cfg: any) => {
           detail:  `종목: ${cfg.futuresCode}\n주문번호: ${b2?.OrdNo ?? '-'}\n수량: ${cfg.futuresQty}계약\n가격: ${(futPrice + 0.5).toFixed(2)}${sampleDetailBg}`,
         });
       } catch (e: any) {
-        await appendLog(`[${cfg.putOptCode}] ❌ 선물 매수 실패: ${e?.message}`);
+        const errMsg = e?.message ?? '알 수 없는 오류';
+        const isInsufficient = errMsg.includes('잔고') || errMsg.includes('증거금') || errMsg.includes('부족') || errMsg.includes('한도');
+        await appendLog(`[${cfg.putOptCode}] ❌ 선물 매수 실패: ${errMsg}`);
         await appendResult({
           type:    'error',
           ts:      nowKST(),
           optCode: cfg.putOptCode,
-          message: `❌ 선물 매수 실패`,
-          detail:  e?.message ?? '알 수 없는 오류',
+          message: isInsufficient ? '❌ 선물 매수 실패 — 잔고/증거금 부족' : '❌ 선물 매수 실패',
+          detail:  isInsufficient
+            ? `잔고 또는 증거금이 부족하여 매수에 실패했습니다.\n\n${errMsg}`
+            : errMsg,
         });
       }
     } else {
