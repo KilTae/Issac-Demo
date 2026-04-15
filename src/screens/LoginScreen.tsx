@@ -60,6 +60,9 @@ const LoginScreen = ({navigation}: Props) => {
         await AsyncStorage.removeItem(SAVE_KEY);
       }
 
+      // 4. 모의/실전 탭 정보 저장
+      await AsyncStorage.setItem('accountType', tab);
+
       // 4. 성공 → 메인으로 이동
       navigation.replace('Main');
     } catch (e: any) {

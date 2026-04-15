@@ -120,37 +120,43 @@ const getWeeklyExpiryDate = (hname: string): Date | null => {
   return null;
 };
 
-// ── 오늘이 만기일 1일 전인지 확인 (일자만 비교) ──────────────────────────────
+// ── 오늘이 만기일인지 확인 (KST 기준 월/일 비교) ────────────────────────────
 const isTodayExpiryDate = (hname: string): boolean => {
   const expiryDate = getWeeklyExpiryDate(hname);
-  if (!expiryDate) return true; // 날짜 파악 불가 시 항상 실행
-  const now = new Date(new Date().getTime() + 9 * 60 * 60 * 1000);
-  // 만기일 1일 전 날짜 계산
-  const dayBefore = new Date(expiryDate);
-  dayBefore.setDate(expiryDate.getDate() - 1);
-  return dayBefore.getDate() === now.getUTCDate();
+  if (!expiryDate) return true;
+  const nowKSTDate = new Date(new Date().getTime() + 9 * 60 * 60 * 1000);
+  return expiryDate.getDate()  === nowKSTDate.getUTCDate() &&
+         expiryDate.getMonth() === nowKSTDate.getUTCMonth();
 };
 
 // ── 종목별 샘플 저장소 (백그라운드용) ────────────────────────────────────────
 const kospiSampleMap: Record<string, number[]> = {};
 
+// ── 주문 마감 시각 — 테스트 시 이 값만 변경하세요 ────────────────────────────
+const ORDER_DEADLINE = '15:32:00';
+
 // ── 단일 자동화 설정 실행 ─────────────────────────────────────────────────────
 const runSingleConfig = async (cfg: any) => {
   const now = nowKST();
-  // 주문 마감시간 14:50:00 고정
-  const ORDER_DEADLINE = '15:32:00';
 
-  // 날짜 조건 체크 — 만기일이 아니면 스킵
-  if (!isTodayExpiryDate(cfg.putOptHname || '')) {
-    const expiryDate = getWeeklyExpiryDate(cfg.putOptHname || '');
-    const expiryStr  = expiryDate
-      ? `${expiryDate.getMonth()+1}/${expiryDate.getDate()}`
-      : '알 수 없음';
-    await appendLog(`[${cfg.putOptCode}] 📅 오늘은 만기일이 아님 (만기: ${expiryStr}) — 대기 중`);
+  // 날짜 조건 체크 — 만기일 1일 전이 아니면 스킵
+  const expiryDate = getWeeklyExpiryDate(cfg.putOptHname || '');
+  const expiryStr  = expiryDate ? `${expiryDate.getMonth()+1}/${expiryDate.getDate()}` : '알 수 없음';
+  const nowKSTDate = new Date(new Date().getTime() + 9 * 60 * 60 * 1000);
+  const todayStr   = `${nowKSTDate.getUTCMonth()+1}/${nowKSTDate.getUTCDate()}`;
+  const dayBefore  = expiryDate ? new Date(expiryDate.getFullYear(), expiryDate.getMonth(), expiryDate.getDate() - 1) : null;
+  const runDateStr = dayBefore ? `${dayBefore.getMonth()+1}/${dayBefore.getDate()}` : '알 수 없음';
+  const isRunDay   = isTodayExpiryDate(cfg.putOptHname || '');
+  console.log(`📅 [${cfg.putOptCode}] 만기일: ${expiryStr} / 실행일(만기-1일): ${runDateStr} / 오늘(KST): ${todayStr} / 조건충족: ${isRunDay}`);
+
+  if (!isRunDay) {
+    await appendLog(`[${cfg.putOptCode}] 📅 오늘(${todayStr})은 실행일(${runDateStr})이 아님 — 대기 중`);
     return;
   }
 
-  if (now >= ORDER_DEADLINE) {
+  // now를 API 호출 없이 바로 체크 (소급 전 시점)
+  const nowBeforeApi = nowKST();
+  if (nowBeforeApi >= ORDER_DEADLINE) {
     await appendLog(`[${cfg.putOptCode}] ⏰ 마감 시각 ${ORDER_DEADLINE} 도달`);
     const futCode   = cfg.futuresCode || 'A0166000';
     const priceData = await getFuturesPrice(futCode);
@@ -273,19 +279,28 @@ const runSingleConfig = async (cfg: any) => {
   }
 
   // 모니터링 중 — 샘플 수집 + 청산 조건 체크
+  // ORDER_DEADLINE 이후면 즉시 종료 (마감 로직은 다음 루프에서 nowBeforeApi로 처리)
+  if (nowKST() >= ORDER_DEADLINE) return;
+
   try {
+    if (nowKST() >= ORDER_DEADLINE) return;
     const futCode   = cfg.futuresCode || 'A0166000';
     const priceData = await getFuturesPrice(futCode);
     const kospi200  = priceData.kospijisu;
     const futPrice  = priceData.price;
+
+    if (nowKST() >= ORDER_DEADLINE) return;
     const optHoga   = await getFuturesHoga(cfg.putOptCode);
     const optPrice  = optHoga.price;
 
+    if (nowKST() >= ORDER_DEADLINE) return;
+
     // ── 코스피200 샘플 수집 (deadline 10분 전부터 1분 간격) ──────────────────
-    const nowMin      = toMinutes(now.slice(0, 5));
+    const nowNow      = nowKST();
+    const nowMin      = toMinutes(nowNow.slice(0, 5));
     const deadlineMin = toMinutes(ORDER_DEADLINE.slice(0, 5));
     const sampleStart = deadlineMin - 10;
-    const nowSec      = parseInt(now.slice(6, 8), 10);
+    const nowSec      = parseInt(nowNow.slice(6, 8), 10);
 
     // 처음 수집 구간 진입 시 t8418로 코스피200 현물지수 분봉 소급
     if (!kospiSampleMap[cfg.putOptCode]) {
@@ -293,9 +308,11 @@ const runSingleConfig = async (cfg: any) => {
 
       const missedCount = Math.max(0, nowMin - sampleStart);
       if (missedCount > 0) {
+        if (nowKST() >= ORDER_DEADLINE) return;
         await appendLog(`[${cfg.putOptCode}] 🔍 코스피200 분봉 소급 조회 (t8418) — ${missedCount}개 필요`);
         try {
           const bars = await getKospi200MinuteBars(missedCount + 3, '101');
+          if (nowKST() >= ORDER_DEADLINE) return;
           // API는 최신순 → 시간 오름차순 정렬 (과거→최신)
           const sorted = [...bars].sort((a, b) => {
             const toMin = (t: string) => parseInt(t.slice(0,2),10)*60 + parseInt(t.slice(2,4),10);
@@ -356,10 +373,12 @@ const runSingleConfig = async (cfg: any) => {
       const slotMM = String(nowMin % 60).padStart(2, '0');
 
       if (samples.length < expectedCount) {  // 소급 슬롯 중복 방지
+        if (nowKST() >= ORDER_DEADLINE) return;
         // t8418로 현재 분의 코스피200 현물지수 조회
         let kospi200Realtime = kospi200;
         try {
           const realtimeBars = await getKospi200MinuteBars(2, '101');
+          if (nowKST() >= ORDER_DEADLINE) return;
           kospi200Realtime = realtimeBars[0]?.close ?? kospi200;
         } catch { /* t2101 폴백 */ }
         samples.push(kospi200Realtime);
@@ -391,7 +410,7 @@ const runSingleConfig = async (cfg: any) => {
       const currentCount = kospiSampleMap[cfg.putOptCode]?.length ?? 0;
       await appendLog(
         `[${cfg.putOptCode}] 🕐 수집 진행 중 [${currentCount}/10]` +
-        ` | ${now.slice(0,8)} | 다음 수집까지 약 ${60 - nowSec}초`,
+        ` | ${nowNow.slice(0,8)} | 다음 수집까지 약 ${60 - nowSec}초`,
       );
     }
 

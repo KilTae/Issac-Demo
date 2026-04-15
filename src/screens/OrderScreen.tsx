@@ -489,6 +489,9 @@ const OrderScreen = () => {
   // ── 체결 탭 (호가 인터벌과 겹치지 않도록 1.5초 딜레이 후 조회) ─────────────
   useEffect(() => {
     if (tab !== '체결') return;
+    // 탭 진입 즉시 이전 데이터 초기화
+    setOrderHistory([]);
+    setHistoryLoading(true);
     const timer = setTimeout(() => {
       fetchOrderHistory(historyFilter);
     }, 1500);
@@ -1347,7 +1350,7 @@ const OrderScreen = () => {
                   <View style={as.tlHeader}>
                     <View style={as.tlDot}/>
                     <Text style={as.tlTitle}>시간 설정</Text>
-                    <Text style={as.tlDesc}>만기일 1일 전 15:32:00에 자동 실행</Text>
+                    <Text style={as.tlDesc}>만기일 당일 15:32:00에 자동 실행</Text>
                   </View>
                   <View style={as.infoBox}>
                     {(() => {
@@ -1375,9 +1378,7 @@ const OrderScreen = () => {
                           if (date.getDay() === targetDow) {
                             count++;
                             if (count === weekNum) {
-                              // 만기일 1일 전
-                              const dayBefore = new Date(year, month, d - 1);
-                              expiryStr = `${dayBefore.getMonth()+1}월 ${dayBefore.getDate()}일 (${dayNames[dayBefore.getDay()]})`;
+                              expiryStr = `${month+1}월 ${d}일 (${dayNames[date.getDay()]})`;
                               break;
                             }
                           }
@@ -1385,7 +1386,7 @@ const OrderScreen = () => {
                       }
                       return (
                         <Text style={as.infoText}>
-                          📅 실행일 (만기 1일 전): <Text style={{fontWeight:'800'}}>{expiryStr}</Text>{'\n'}
+                          📅 만기일: <Text style={{fontWeight:'800'}}>{expiryStr}</Text>{'\n'}
                           ⏰ 주문 마감 시각: <Text style={{fontWeight:'800', color:C.red}}>15:32:00</Text> 고정
                         </Text>
                       );
@@ -1501,7 +1502,7 @@ const OrderScreen = () => {
                             ['행사가',   `${cfg.putStrike.toFixed(2)}`],
                             ['청산 예약', cfg.exitEnabled ? `${cfg.exitThreshold.toFixed(2)} P 이하` : '미사용'],
                             ['선물 매수', `${cfg.futuresCode} / ${cfg.futuresQty}계약`],
-                            ['시간',      `만기일 1일 전 15:32 자동 실행`],
+                            ['시간',      `만기일 15:32 자동 실행`],
                           ].map(([label, val]) => (
                             <View key={label} style={as.queryRow}>
                               <Text style={as.queryLabel}>{label}</Text>
@@ -1534,26 +1535,6 @@ const OrderScreen = () => {
                         </View>
                       );
                     })}
-
-                    {/* 실행 로그 */}
-                    {autoLog.length > 0 && (
-                      <View style={as.logBox}>
-                        <View style={{flexDirection:'row', justifyContent:'space-between', marginBottom:6}}>
-                          <Text style={as.logTitle}>실행 로그</Text>
-                          <TouchableOpacity onPress={() => setAutoLog([])}>
-                            <Text style={{fontSize:11, color:C.dimText}}>지우기</Text>
-                          </TouchableOpacity>
-                        </View>
-                        {autoLog.map((line, i) => (
-                          <Text key={i} style={[as.logLine, {
-                            color: line.includes('✅') ? C.green  :
-                                   line.includes('❌') ? C.red    :
-                                   line.includes('⚠️') ? C.orange :
-                                   line.includes('⏰') ? C.navy   : C.subText,
-                          }]}>{line}</Text>
-                        ))}
-                      </View>
-                    )}
 
                     {/* 백그라운드 서비스 중지 버튼 */}
                     {bgRunning && (
@@ -1604,6 +1585,11 @@ const OrderScreen = () => {
                   </TouchableOpacity>
                 ))}
               </View>
+              {ableQty === 0 && closeQty === 0 && !ableQtyLoading && (
+                <Text style={{fontSize:10, color:C.dimText, marginTop:2}}>
+                  ※ 모의투자 계좌는 잔고 조회가 지원되지 않습니다
+                </Text>
+              )}
               <View style={s.stepper}>
                 <TouchableOpacity onPress={() => setQty(q => Math.max(0,q-1))} style={s.stepBtn}><Text style={s.stepBtnText}>−</Text></TouchableOpacity>
                 <Text style={s.stepVal}>{qty} <Text style={s.stepUnit}>계약</Text></Text>
