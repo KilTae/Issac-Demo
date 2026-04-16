@@ -120,10 +120,10 @@ const getWeeklyExpiryDate = (hname: string): Date | null => {
   return null;
 };
 
-// ── 오늘이 만기일인지 확인 (KST 기준 월/일 비교) ────────────────────────────
+// ── 오늘이 만기일 1일 전인지 확인 (KST 기준 일자 비교) ──────────────────────
 const isTodayExpiryDate = (hname: string): boolean => {
   const expiryDate = getWeeklyExpiryDate(hname);
-  if (!expiryDate) return true;
+  if (!expiryDate) return true; // 날짜 파악 불가 시 항상 실행
   const nowKSTDate = new Date(new Date().getTime() + 9 * 60 * 60 * 1000);
   return expiryDate.getDate()  === nowKSTDate.getUTCDate() &&
          expiryDate.getMonth() === nowKSTDate.getUTCMonth();
@@ -144,13 +144,11 @@ const runSingleConfig = async (cfg: any) => {
   const expiryStr  = expiryDate ? `${expiryDate.getMonth()+1}/${expiryDate.getDate()}` : '알 수 없음';
   const nowKSTDate = new Date(new Date().getTime() + 9 * 60 * 60 * 1000);
   const todayStr   = `${nowKSTDate.getUTCMonth()+1}/${nowKSTDate.getUTCDate()}`;
-  const dayBefore  = expiryDate ? new Date(expiryDate.getFullYear(), expiryDate.getMonth(), expiryDate.getDate() - 1) : null;
-  const runDateStr = dayBefore ? `${dayBefore.getMonth()+1}/${dayBefore.getDate()}` : '알 수 없음';
   const isRunDay   = isTodayExpiryDate(cfg.putOptHname || '');
-  console.log(`📅 [${cfg.putOptCode}] 만기일: ${expiryStr} / 실행일(만기-1일): ${runDateStr} / 오늘(KST): ${todayStr} / 조건충족: ${isRunDay}`);
+  console.log(`📅 [${cfg.putOptCode}] 만기일: ${expiryStr} / 오늘(KST): ${todayStr} / 조건충족: ${isRunDay}`);
 
   if (!isRunDay) {
-    await appendLog(`[${cfg.putOptCode}] 📅 오늘(${todayStr})은 실행일(${runDateStr})이 아님 — 대기 중`);
+    await appendLog(`[${cfg.putOptCode}] 📅 오늘(${todayStr})은 만기일(${expiryStr})이 아님 — 대기 중`);
     return;
   }
 
@@ -416,8 +414,8 @@ const runSingleConfig = async (cfg: any) => {
 
     await appendLog(`[${cfg.putOptCode}] 코스피: ${kospi200.toFixed(2)} | 옵션: ${optPrice.toFixed(2)}P | 선물: ${futPrice.toFixed(2)}${(kospiSampleMap[cfg.putOptCode]?.length ?? 0) > 0 ? ` | 샘플 ${kospiSampleMap[cfg.putOptCode].length}/10` : ''}`);
 
-    if (cfg.exitEnabled && cfg.exitPrice > 0 && optPrice <= cfg.exitPrice) {
-      await appendLog(`[${cfg.putOptCode}] ⚠️ 청산 조건 충족 — 옵션가 ${optPrice.toFixed(2)} ≤ 기준가 ${cfg.exitPrice.toFixed(2)} — 주문 시작`);
+    if (cfg.exitEnabled && cfg.exitThreshold > 0 && optPrice <= cfg.exitThreshold) {
+      await appendLog(`[${cfg.putOptCode}] ⚠️ 청산 조건 충족 — 옵션가 ${optPrice.toFixed(2)} ≤ ${cfg.exitThreshold.toFixed(2)} — 주문 시작`);
       try {
         const res = await placeOrder({
           fnoIsuNo:  cfg.putOptCode,
@@ -433,7 +431,7 @@ const runSingleConfig = async (cfg: any) => {
           ts:      nowKST(),
           optCode: cfg.putOptCode,
           message: `✅ 풋옵션 자동 청산 완료`,
-          detail:  `종목: ${cfg.putOptCode}\n주문번호: ${b2?.OrdNo ?? '-'}\n청산가: ${optPrice.toFixed(2)}P\n(기준가: ${cfg.exitPrice.toFixed(2)}P 이하 도달)`,
+          detail:  `종목: ${cfg.putOptCode}\n주문번호: ${b2?.OrdNo ?? '-'}\n청산가: ${optPrice.toFixed(2)}P\n(${cfg.exitThreshold.toFixed(2)}P 이하 도달)`,
         });
 
         // 완료된 설정 삭제

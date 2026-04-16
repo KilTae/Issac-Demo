@@ -58,7 +58,6 @@ interface AutoConfig {
   futuresCode:   string;
   futuresQty:    number;
   exitThreshold: number;
-  exitPrice:     number;
   exitEnabled:   boolean;
 }
 
@@ -298,7 +297,6 @@ const OrderScreen = () => {
     futuresCode:       isFuturesCode ? (shcode ?? '') : getNearestFuturesCode().code,
     futuresQty:        1,
     exitThreshold:     0.20,
-    exitPrice:         0,
     exitEnabled:       true,
   });
 
@@ -1289,18 +1287,8 @@ const OrderScreen = () => {
                   {autoConfig.exitEnabled && (
                     <View style={{paddingTop:4, paddingHorizontal:2, gap:2}}>
                       <Text style={{fontSize:11, color:C.subText}}>
-                        현재 옵션가{autoOptPrice !== null ? `(${autoOptPrice.toFixed(2)})` : ''} - {autoConfig.exitThreshold.toFixed(2)} = 자동 청산 기준가
+                        옵션가가 <Text style={{fontWeight:'800', color:C.blue}}>{autoConfig.exitThreshold.toFixed(2)} P</Text> 이하가 되면 자동 청산됩니다
                       </Text>
-                      {autoConfig.exitPrice > 0 && (
-                        <Text style={{fontSize:12, fontWeight:'700', color:C.orange}}>
-                          📌 등록된 청산 기준가: {autoConfig.exitPrice.toFixed(2)} P
-                        </Text>
-                      )}
-                      {autoConfig.exitPrice === 0 && (
-                        <Text style={{fontSize:11, color:C.dimText}}>
-                          등록 버튼 누를 때 현재 옵션가 기준으로 자동 계산됩니다
-                        </Text>
-                      )}
                     </View>
                   )}
                 </View>
@@ -1404,37 +1392,23 @@ const OrderScreen = () => {
                     <TouchableOpacity
                       style={[s.mainOrderBtn, {backgroundColor: C.green}]}
                       onPress={async () => {
-                        // 등록 시점 옵션가 조회 → exitPrice 계산
-                        let calculatedExitPrice = autoConfig.exitPrice;
-                        if (autoConfig.exitEnabled && autoConfig.putOptCode) {
-                          try {
-                            const hoga = await getFuturesHoga(autoConfig.putOptCode);
-                            calculatedExitPrice = +(hoga.price - autoConfig.exitThreshold).toFixed(2);
-                            addLog(`📌 등록 시점 옵션가: ${hoga.price.toFixed(2)} → 청산 기준가: ${calculatedExitPrice.toFixed(2)}`);
-                          } catch {
-                            addLog('⚠️ 옵션가 조회 실패 — 이전 청산 기준가 유지');
-                          }
-                        }
-                        const cfgToSave = {...autoConfig, exitPrice: calculatedExitPrice};
-
                         const lines = [
-                          `풋옵션: ${cfgToSave.putOptCode || shcode} / 행사가: ${cfgToSave.putStrike}`,
-                          cfgToSave.exitEnabled ? `청산 기준가: ${calculatedExitPrice.toFixed(2)}P (현재가 - ${cfgToSave.exitThreshold.toFixed(2)})` : '',
-                          `선물 매수: ${cfgToSave.futuresCode} ${cfgToSave.futuresQty}계약`,
+                          `풋옵션: ${autoConfig.putOptCode || shcode} / 행사가: ${autoConfig.putStrike}`,
+                          autoConfig.exitEnabled ? `청산 조건: ${autoConfig.exitThreshold.toFixed(2)}P 이하` : '',
+                          `선물 매수: ${autoConfig.futuresCode} ${autoConfig.futuresQty}계약`,
                           '',
                           confirmMsg,
                         ].filter(Boolean).join('\n');
                         Alert.alert(confirmTitle, lines, [
                           {text: '취소', style: 'cancel'},
                           {text: btnLabel, onPress: () => {
-                            setAutoConfig(cfgToSave);
-                            saveAutoConfig(cfgToSave);
+                            saveAutoConfig(autoConfig);
                             if (!isBackgroundServiceRunning()) {
                               startBackgroundService()
                                 .then(() => setBgRunning(true))
                                 .catch(e => console.log('❌ BG 시작 실패:', e?.message));
                             }
-                            addLog(`✅ ${isExisting ? '수정' : '등록'} 완료: ${cfgToSave.putOptCode} / 청산 기준가: ${calculatedExitPrice.toFixed(2)}`);
+                            addLog(`✅ ${isExisting ? '수정' : '등록'} 완료: ${autoConfig.putOptCode} / 청산: ${autoConfig.exitThreshold.toFixed(2)}P 이하`);
                             setAutoSubTab('조회');
                           }},
                         ]);
